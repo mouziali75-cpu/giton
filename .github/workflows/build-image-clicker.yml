@@ -25,7 +25,7 @@ jobs:
       - name: Generate Android project
         run: |
           set -e
-          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker ic-android/app/src/main/res/xml ic-android/app/src/main/res/values ic-android/app/src/main/res/mipmap-xxxhdpi
+          mkdir -p ic-android/app/src/main/res/mipmap-xxxhdpi
           mkdir -p $(dirname ic-android/settings.gradle.kts)
           cat > ic-android/settings.gradle.kts <<'IC_EOF'
           pluginManagement {
@@ -82,6 +82,7 @@ jobs:
 
           dependencies {
               implementation("org.opencv:opencv:4.9.0")
+              implementation("com.google.mlkit:text-recognition:16.0.0")
           }
           IC_EOF
           mkdir -p $(dirname ic-android/app/src/main/AndroidManifest.xml)
@@ -93,8 +94,10 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
               <application
+                  android:allowBackup="false"
                   android:icon="@mipmap/ic_launcher"
                   android:label="Image Clicker"
                   android:theme="@android:style/Theme.DeviceDefault">
@@ -134,7 +137,9 @@ jobs:
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
               android:accessibilityEventTypes="typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
               android:canPerformGestures="true"
+              android:canRetrieveWindowContent="false"
               android:description="@string/accessibility_desc"
               android:notificationTimeout="100" />
           IC_EOF
@@ -153,8 +158,15 @@ jobs:
 
           object Store {
               fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
               fun cps(c: Context): Int = prefs(c).getInt("cps", 15)
               fun setCps(c: Context, v: Int) = prefs(c).edit().putInt("cps", v).apply()
+              fun threshold(c: Context): Int = prefs(c).getInt("thr", 80)
+              fun setThreshold(c: Context, v: Int) = prefs(c).edit().putInt("thr", v).apply()
+              fun scanMs(c: Context): Long = prefs(c).getInt("scan", 500).toLong()
+              fun setScanMs(c: Context, v: Int) = prefs(c).edit().putInt("scan", v).apply()
+              fun markers(c: Context): Boolean = prefs(c).getBoolean("markers", false)
+              fun setMarkers(c: Context, v: Boolean) = prefs(c).edit().putBoolean("markers", v).apply()
 
               /** Unlimited farm tap points, stored as "x,y;x,y;..." */
               fun points(c: Context): List<Pair<Float, Float>> {
@@ -166,11 +178,758 @@ jobs:
                       if (x != null && y != null) Pair(x, y) else null
                   }
               }
-              fun addPoint(c: Context, x: Float, y: Float) {
-                  val raw = prefs(c).getString("pts", "") ?: ""
-                  prefs(c).edit().putString("pts", if (raw.isEmpty()) "$x,$y" else "$raw;$x,$y").apply()
+              fun setPoints(c: Context, list: List<Pair<Float, Float>>) =
+                  prefs(c).edit().putString("pts", list.joinToString(";") { "${it.first},${it.second}" }).apply()
+              fun removePoint(c: Context, i: Int) {
+                  val l = points(c).toMutableList()
+                  if (i in l.indices) { l.removeAt(i); setPoints(c, l) }
               }
-              fun clearPoints(c: Context) = prefs(c).edit().remove("pts").apply()
+
+              fun flex(c: Context): Boolean = prefs(c).getBoolean("flex", true)
+              fun setFlex(c: Context, v: Boolean) = prefs(c).edit().putBoolean("flex", v).apply()
+              fun textMs(c: Context): Long = prefs(c).getInt("textms", 1500).toLong()
+              fun setTextMs(c: Context, v: Int) = prefs(c).edit().putInt("textms", v).apply()
+
+              private val DEFAULT_WORDS = listOf("Claim", "Collect", "Skip", "Skip Ad", "Close", "Continue")
+
+              /** Words the app reads on screen (OCR) and clicks. Stored as "word|1;word|0" */
+              fun words(c: Context): List<Pair<String, Boolean>> {
+                  val raw = prefs(c).getString("words", null) ?: return DEFAULT_WORDS.map { Pair(it, true) }
+                  return raw.split(";").filter { it.isNotBlank() }.map {
+                      val i = it.lastIndexOf('|')
+                      if (i < 0) Pair(it, true) else Pair(it.substring(0, i), it.substring(i + 1) == "1")
+                  }
+              }
+              fun wordsRaw(c: Context): String = prefs(c).getString("words", "") ?: ""
+              fun setWordsRaw(c: Context, raw: String) = prefs(c).edit().putString("words", raw).apply()
+              fun setWords(c: Context, list: List<Pair<String, Boolean>>) =
+                  setWordsRaw(c, list.joinToString(";") {
+                      it.first.replace(";", " ").replace("|", " ").trim() + "|" + (if (it.second) "1" else "0")
+                  })
+              fun resetWords(c: Context) = prefs(c).edit().remove("words").apply()
+          }
+          IC_EOF
+          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Targets.kt)
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Targets.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.FileOutputStream
+
+          /** One picture to look for. fx/fy = where inside the picture the click lands (0..1). */
+          class Target(
+              val id: String,
+              var name: String,
+              var enabled: Boolean = true,
+              var fx: Float = 0.5f,
+              var fy: Float = 0.5f
+          )
+
+          object Targets {
+              fun dir(c: Context): File = File(c.filesDir, "targets").apply { mkdirs() }
+              private fun image(c: Context, t: Target): File = File(dir(c), t.id + ".png")
+
+              fun list(c: Context): List<Target> {
+                  val out = ArrayList<Target>()
+                  try {
+                      val f = File(dir(c), "meta.json")
+                      if (f.exists()) {
+                          val a = JSONArray(f.readText())
+                          for (i in 0 until a.length()) {
+                              val o = a.getJSONObject(i)
+                              val id = o.getString("id")
+                              if (File(dir(c), "$id.png").exists()) {
+                                  out.add(
+                                      Target(
+                                          id, o.optString("name", "Target"), o.optBoolean("on", true),
+                                          o.optDouble("fx", 0.5).toFloat(), o.optDouble("fy", 0.5).toFloat()
+                                      )
+                                  )
+                              }
+                          }
+                      }
+                  } catch (e: Exception) { }
+                  return out
+              }
+
+              fun saveAll(c: Context, list: List<Target>) {
+                  val a = JSONArray()
+                  for (t in list) {
+                      a.put(
+                          JSONObject().put("id", t.id).put("name", t.name).put("on", t.enabled)
+                              .put("fx", t.fx.toDouble()).put("fy", t.fy.toDouble())
+                      )
+                  }
+                  File(dir(c), "meta.json").writeText(a.toString())
+              }
+
+              /** Writes the picture, returns the new Target (caller adds it to its list and calls saveAll). */
+              fun createImage(c: Context, crop: Bitmap): Target {
+                  val id = "t" + System.currentTimeMillis()
+                  FileOutputStream(File(dir(c), "$id.png")).use { crop.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                  return Target(id, "Target", true, 0.5f, 0.5f)
+              }
+
+              fun delete(c: Context, t: Target) {
+                  image(c, t).delete()
+                  saveAll(c, list(c).filter { it.id != t.id })
+              }
+
+              fun clear(c: Context) { dir(c).listFiles()?.forEach { it.delete() } }
+
+              fun bitmap(c: Context, t: Target): Bitmap? = BitmapFactory.decodeFile(image(c, t).path)
+          }
+          IC_EOF
+          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Profiles.kt)
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Profiles.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import org.json.JSONObject
+          import java.io.File
+
+          /** Named snapshots of: targets (+ click points), tap points, speed, sensitivity, scan interval. */
+          object Profiles {
+              private fun root(c: Context): File = File(c.filesDir, "profiles").apply { mkdirs() }
+
+              fun safe(n: String): String = n.trim().replace(Regex("[^\\p{L}\\p{N} _-]"), "_").take(40)
+
+              fun list(c: Context): List<String> =
+                  root(c).listFiles { f -> f.isDirectory }?.map { it.name }?.sorted() ?: emptyList()
+
+              fun active(c: Context): String = Store.prefs(c).getString("active", "") ?: ""
+
+              fun save(c: Context, name: String): Boolean {
+                  val n = safe(name)
+                  if (n.isEmpty()) return false
+                  val d = File(root(c), n)
+                  d.deleteRecursively(); d.mkdirs()
+                  Targets.dir(c).listFiles()?.forEach { it.copyTo(File(d, it.name), true) }
+                  val cfg = JSONObject()
+                      .put("cps", Store.cps(c)).put("thr", Store.threshold(c)).put("scan", Store.scanMs(c).toInt())
+                      .put("pts", Store.prefs(c).getString("pts", "") ?: "")
+                      .put("words", Store.wordsRaw(c)).put("hasWords", Store.prefs(c).contains("words"))
+                      .put("flex", Store.flex(c)).put("textms", Store.textMs(c).toInt())
+                  File(d, "config.json").writeText(cfg.toString())
+                  Store.prefs(c).edit().putString("active", n).apply()
+                  return true
+              }
+
+              fun load(c: Context, name: String): Boolean {
+                  val d = File(root(c), name)
+                  if (!d.isDirectory) return false
+                  Targets.clear(c)
+                  d.listFiles()?.forEach { if (it.name != "config.json") it.copyTo(File(Targets.dir(c), it.name), true) }
+                  try {
+                      val j = JSONObject(File(d, "config.json").readText())
+                      Store.setCps(c, j.optInt("cps", 15))
+                      Store.setThreshold(c, j.optInt("thr", 80))
+                      Store.setScanMs(c, j.optInt("scan", 500))
+                      Store.prefs(c).edit().putString("pts", j.optString("pts", "")).apply()
+                      if (j.optBoolean("hasWords", false)) Store.setWordsRaw(c, j.optString("words", "")) else Store.resetWords(c)
+                      Store.setFlex(c, j.optBoolean("flex", true))
+                      Store.setTextMs(c, j.optInt("textms", 1500))
+                  } catch (e: Exception) { }
+                  Store.prefs(c).edit().putString("active", name).apply()
+                  return true
+              }
+
+              fun delete(c: Context, name: String) {
+                  File(root(c), name).deleteRecursively()
+                  if (active(c) == name) Store.prefs(c).edit().remove("active").apply()
+              }
+          }
+          IC_EOF
+          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Icons.kt)
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Icons.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.view.View
+
+          /** Hand-drawn line icons, one colour, drawn on a 24x24 grid. */
+          object Ic {
+              const val PLAY = 0
+              const val PAUSE = 1
+              const val ADD = 2
+              const val TARGET = 3
+              const val PENCIL = 4
+              const val EYE = 5
+              const val SLIDERS = 6
+              const val TRASH = 7
+              const val GRIP = 8
+              const val CLOSE = 9
+              const val SAVE = 10
+              const val HOME = 11
+              const val LIST = 12
+              const val INFO = 13
+              const val CHECK = 14
+              const val WARN = 15
+
+              fun draw(cv: Canvas, kind: Int, p: Paint, color: Int, left: Float, top: Float, size: Float) {
+                  cv.save()
+                  cv.translate(left, top)
+                  val u = size / 24f
+                  cv.scale(u, u)
+                  p.color = color
+                  p.strokeWidth = 2f
+                  p.strokeCap = Paint.Cap.ROUND
+                  p.strokeJoin = Paint.Join.ROUND
+                  val line = Paint.Style.STROKE
+                  val solid = Paint.Style.FILL
+                  when (kind) {
+                      PLAY -> {
+                          p.style = Paint.Style.FILL_AND_STROKE
+                          val a = Path()
+                          a.moveTo(7f, 5f); a.lineTo(19f, 12f); a.lineTo(7f, 19f); a.close()
+                          cv.drawPath(a, p)
+                      }
+                      PAUSE -> {
+                          p.style = Paint.Style.FILL_AND_STROKE
+                          cv.drawRoundRect(RectF(6.5f, 5.5f, 9.5f, 18.5f), 1f, 1f, p)
+                          cv.drawRoundRect(RectF(14.5f, 5.5f, 17.5f, 18.5f), 1f, 1f, p)
+                      }
+                      ADD -> {
+                          p.style = line
+                          cv.drawLine(12f, 5f, 12f, 19f, p); cv.drawLine(5f, 12f, 19f, 12f, p)
+                      }
+                      TARGET -> {
+                          p.style = line
+                          cv.drawCircle(12f, 12f, 6.5f, p)
+                          cv.drawLine(12f, 2.5f, 12f, 6f, p); cv.drawLine(12f, 18f, 12f, 21.5f, p)
+                          cv.drawLine(2.5f, 12f, 6f, 12f, p); cv.drawLine(18f, 12f, 21.5f, 12f, p)
+                          p.style = solid
+                          cv.drawCircle(12f, 12f, 1.7f, p)
+                      }
+                      PENCIL -> {
+                          p.style = line
+                          val a = Path()
+                          a.moveTo(4f, 20f); a.lineTo(5.2f, 15.2f); a.lineTo(15.5f, 4.9f)
+                          a.lineTo(19.1f, 8.5f); a.lineTo(8.8f, 18.8f); a.close()
+                          cv.drawPath(a, p)
+                          cv.drawLine(13.5f, 6.9f, 17.1f, 10.5f, p)
+                      }
+                      EYE -> {
+                          p.style = line
+                          cv.drawOval(RectF(2f, 6.5f, 22f, 17.5f), p)
+                          cv.drawCircle(12f, 12f, 3f, p)
+                      }
+                      SLIDERS -> {
+                          p.style = line
+                          cv.drawLine(4f, 6f, 20f, 6f, p); cv.drawLine(4f, 12f, 20f, 12f, p); cv.drawLine(4f, 18f, 20f, 18f, p)
+                          p.style = solid
+                          cv.drawCircle(9f, 6f, 2.6f, p); cv.drawCircle(15f, 12f, 2.6f, p); cv.drawCircle(8f, 18f, 2.6f, p)
+                      }
+                      TRASH -> {
+                          p.style = line
+                          cv.drawLine(4f, 7f, 20f, 7f, p)
+                          val a = Path()
+                          a.moveTo(9f, 7f); a.lineTo(9f, 4f); a.lineTo(15f, 4f); a.lineTo(15f, 7f)
+                          cv.drawPath(a, p)
+                          val b = Path()
+                          b.moveTo(6f, 7f); b.lineTo(7f, 20f); b.lineTo(17f, 20f); b.lineTo(18f, 7f)
+                          cv.drawPath(b, p)
+                          cv.drawLine(10f, 11f, 10f, 16f, p); cv.drawLine(14f, 11f, 14f, 16f, p)
+                      }
+                      GRIP -> {
+                          p.style = solid
+                          for (y in listOf(6f, 12f, 18f)) { cv.drawCircle(9f, y, 1.7f, p); cv.drawCircle(15f, y, 1.7f, p) }
+                      }
+                      CLOSE -> {
+                          p.style = line
+                          cv.drawLine(6f, 6f, 18f, 18f, p); cv.drawLine(18f, 6f, 6f, 18f, p)
+                      }
+                      SAVE -> {
+                          p.style = line
+                          cv.drawRoundRect(RectF(4f, 4f, 20f, 20f), 2.5f, 2.5f, p)
+                          cv.drawRect(RectF(8f, 4f, 16f, 9f), p)
+                          cv.drawRect(RectF(8f, 14f, 16f, 20f), p)
+                      }
+                      HOME -> {
+                          p.style = line
+                          val a = Path()
+                          a.moveTo(3f, 11f); a.lineTo(12f, 3.5f); a.lineTo(21f, 11f)
+                          cv.drawPath(a, p)
+                          val b = Path()
+                          b.moveTo(5.5f, 9.5f); b.lineTo(5.5f, 20f); b.lineTo(18.5f, 20f); b.lineTo(18.5f, 9.5f)
+                          cv.drawPath(b, p)
+                          val d = Path()
+                          d.moveTo(10f, 20f); d.lineTo(10f, 14.5f); d.lineTo(14f, 14.5f); d.lineTo(14f, 20f)
+                          cv.drawPath(d, p)
+                      }
+                      LIST -> {
+                          p.style = line
+                          cv.drawLine(9f, 6f, 20f, 6f, p); cv.drawLine(9f, 12f, 20f, 12f, p); cv.drawLine(9f, 18f, 20f, 18f, p)
+                          p.style = solid
+                          cv.drawCircle(4.5f, 6f, 1.5f, p); cv.drawCircle(4.5f, 12f, 1.5f, p); cv.drawCircle(4.5f, 18f, 1.5f, p)
+                      }
+                      INFO -> {
+                          p.style = line
+                          cv.drawCircle(12f, 12f, 9f, p)
+                          cv.drawLine(12f, 11f, 12f, 17f, p)
+                          p.style = solid
+                          cv.drawCircle(12f, 7.6f, 1.2f, p)
+                      }
+                      CHECK -> {
+                          p.style = line
+                          val a = Path()
+                          a.moveTo(5f, 12.5f); a.lineTo(10f, 17.5f); a.lineTo(19f, 7f)
+                          cv.drawPath(a, p)
+                      }
+                      WARN -> {
+                          p.style = line
+                          val a = Path()
+                          a.moveTo(12f, 3.5f); a.lineTo(21.5f, 20f); a.lineTo(2.5f, 20f); a.close()
+                          cv.drawPath(a, p)
+                          cv.drawLine(12f, 9.5f, 12f, 14f, p)
+                          p.style = solid
+                          cv.drawCircle(12f, 17f, 1.1f, p)
+                      }
+                  }
+                  cv.restore()
+              }
+          }
+
+          class IconView(c: Context, var kind: Int, var color: Int = Theme.ICON) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              override fun onDraw(cv: Canvas) {
+                  val s = minOf(width, height).toFloat()
+                  Ic.draw(cv, kind, p, color, (width - s) / 2f, (height - s) / 2f, s)
+              }
+          }
+          IC_EOF
+          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Ui.kt)
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Ui.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.content.res.ColorStateList
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.graphics.Bitmap
+          import android.graphics.drawable.GradientDrawable
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import kotlin.math.min
+
+          object Theme {
+              val BG = 0xFF0F0A28.toInt()
+              val CARD = 0xFF1C1445.toInt()
+              val CARD2 = 0xFF2A1F63.toInt()
+              val ACCENT = 0xFF7C5CFF.toInt()
+              val GOLD = 0xFFFFC93C.toInt()
+              val TEXT = 0xFFF3F0FF.toInt()
+              val MUTED = 0xFFA79FD0.toInt()
+              val ICON = 0xFFEDE9FE.toInt()
+              val OK = 0xFF34D399.toInt()
+              val BAD = 0xFFF87171.toInt()
+          }
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+          fun Context.dpf(v: Float): Float = v * resources.displayMetrics.density
+
+          fun rounded(color: Int, radius: Float, stroke: Int = 0, strokeW: Int = 0): GradientDrawable =
+              GradientDrawable().apply {
+                  setColor(color)
+                  cornerRadius = radius
+                  if (strokeW > 0) setStroke(strokeW, stroke)
+              }
+
+          object Ui {
+              private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+              fun text(c: Context, t: String, size: Float = 15f, color: Int = Theme.TEXT, bold: Boolean = false): TextView =
+                  TextView(c).apply {
+                      text = t
+                      textSize = size
+                      setTextColor(color)
+                      if (bold) typeface = Typeface.DEFAULT_BOLD
+                  }
+
+              fun card(c: Context): LinearLayout = LinearLayout(c).apply {
+                  orientation = LinearLayout.VERTICAL
+                  background = rounded(Theme.CARD, c.dpf(18f))
+                  setPadding(c.dp(16), c.dp(14), c.dp(16), c.dp(14))
+                  layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = c.dp(12) }
+              }
+
+              fun gap(c: Context, h: Int): View = View(c).apply { layoutParams = LinearLayout.LayoutParams(MATCH, c.dp(h)) }
+
+              fun button(c: Context, label: String, primary: Boolean = true, icon: Int = -1, onClick: () -> Unit): View {
+                  val row = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      background = rounded(if (primary) Theme.ACCENT else Theme.CARD2, c.dpf(14f))
+                      setPadding(c.dp(14), c.dp(12), c.dp(14), c.dp(12))
+                      layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = c.dp(8) }
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                  }
+                  if (icon >= 0) {
+                      row.addView(IconView(c, icon), LinearLayout.LayoutParams(c.dp(20), c.dp(20)).apply { rightMargin = c.dp(8) })
+                  }
+                  row.addView(text(c, label, 15f, Theme.TEXT, true))
+                  return row
+              }
+
+              fun chip(c: Context, label: String, selected: Boolean = true, onClick: () -> Unit): TextView =
+                  TextView(c).apply {
+                      text = label
+                      textSize = 13f
+                      setTextColor(Theme.TEXT)
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(c.dp(14), c.dp(7), c.dp(14), c.dp(7))
+                      background = rounded(if (selected) Theme.ACCENT else Theme.CARD2, c.dpf(14f))
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                  }
+
+              fun iconBtn(c: Context, icon: Int, tint: Int = Theme.ICON, onClick: () -> Unit): View =
+                  FrameLayout(c).apply {
+                      background = rounded(Theme.CARD2, c.dpf(12f))
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                      addView(IconView(c, icon, tint), FrameLayout.LayoutParams(c.dp(20), c.dp(20), Gravity.CENTER))
+                      layoutParams = LinearLayout.LayoutParams(c.dp(40), c.dp(40)).apply { leftMargin = c.dp(8) }
+                  }
+
+              fun slider(
+                  c: Context, parent: LinearLayout, title: String,
+                  lo: Int, hi: Int, step: Int, cur: Int, unit: String, save: (Int) -> Unit
+              ) {
+                  val label = text(c, "$title: $cur$unit", 14f, Theme.TEXT)
+                  label.setPadding(0, c.dp(10), 0, 0)
+                  parent.addView(label)
+                  val bar = SeekBar(c)
+                  bar.progressTintList = ColorStateList.valueOf(Theme.ACCENT)
+                  bar.progressBackgroundTintList = ColorStateList.valueOf(Theme.CARD2)
+                  bar.thumbTintList = ColorStateList.valueOf(Theme.GOLD)
+                  bar.max = (hi - lo) / step
+                  bar.progress = (cur - lo) / step
+                  bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          val v = lo + p * step
+                          save(v)
+                          label.text = "$title: $v$unit"
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  parent.addView(bar)
+              }
+          }
+
+          class ToggleView(c: Context, var on: Boolean, private val onChange: (Boolean) -> Unit) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              init {
+                  isClickable = true
+                  setOnClickListener { on = !on; invalidate(); onChange(on) }
+              }
+              override fun onMeasure(w: Int, h: Int) {
+                  setMeasuredDimension(context.dp(46), context.dp(26))
+              }
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  p.color = if (on) Theme.ACCENT else Theme.CARD2
+                  cv.drawRoundRect(RectF(0f, 0f, w, h), h / 2, h / 2, p)
+                  p.color = if (on) Theme.GOLD else Theme.MUTED
+                  val r = h / 2 - context.dpf(3f)
+                  cv.drawCircle(if (on) w - h / 2 else h / 2, h / 2, r, p)
+              }
+          }
+
+          /** Shows a target picture with a gold cross where the click lands. Interactive = tap to move the cross. */
+          class ThumbView(
+              c: Context,
+              private val bmp: Bitmap,
+              var fx: Float,
+              var fy: Float,
+              private val interactive: Boolean = false
+          ) : View(c) {
+              private val bp = Paint(Paint.FILTER_BITMAP_FLAG)
+              private val cp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = Theme.GOLD
+                  strokeWidth = c.dpf(2f)
+              }
+              private val wp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = 0xFF000000.toInt()
+                  strokeWidth = c.dpf(4f)
+              }
+
+              private fun dst(): RectF {
+                  val s = min(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
+                  val w = bmp.width * s
+                  val h = bmp.height * s
+                  val l = (width - w) / 2f
+                  val t = (height - h) / 2f
+                  return RectF(l, t, l + w, t + h)
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val r = dst()
+                  cv.drawBitmap(bmp, null, r, bp)
+                  val x = r.left + r.width() * fx
+                  val y = r.top + r.height() * fy
+                  val rad = context.dpf(8f)
+                  val tick = context.dpf(6f)
+                  for (pt in listOf(wp, cp)) {
+                      cv.drawCircle(x, y, rad, pt)
+                      cv.drawLine(x - rad - tick, y, x - rad, y, pt); cv.drawLine(x + rad, y, x + rad + tick, y, pt)
+                      cv.drawLine(x, y - rad - tick, x, y - rad, pt); cv.drawLine(x, y + rad, x, y + rad + tick, pt)
+                  }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (!interactive) return false
+                  val r = dst()
+                  fx = ((e.x - r.left) / r.width()).coerceIn(0f, 1f)
+                  fy = ((e.y - r.top) / r.height()).coerceIn(0f, 1f)
+                  invalidate()
+                  return true
+              }
+          }
+          IC_EOF
+          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/EditorView.kt)
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/EditorView.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PointF
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.hypot
+          import kotlin.math.max
+          import kotlin.math.min
+
+          /** A target found on the frozen screenshot. Coordinates are screenshot pixels. */
+          class Found(val t: Target, val l: Float, val top: Float, val r: Float, val b: Float, val score: Double) {
+              fun clickX(): Float = l + (r - l) * t.fx
+              fun clickY(): Float = top + (b - top) * t.fy
+          }
+
+          /**
+           * Full-screen editor on top of a frozen screenshot.
+           *  mode 0: tap empty space = add tap point, drag a numbered point = move it (drop on trash = delete),
+           *          drag a gold dot = change where that target is clicked.
+           *  mode 1: drag a box = create a new target.
+           */
+          class EditorView(
+              c: Context,
+              private val bmp: Bitmap,
+              val points: MutableList<PointF>,
+              var found: List<Found>
+          ) : View(c) {
+
+              var mode = 0
+              var onBox: ((RectF) -> Unit)? = null
+
+              private val fillP = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+              private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  typeface = Typeface.DEFAULT_BOLD
+              }
+              private val iconP = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              private var dragPoint = -1
+              private var dragDot = -1
+              private var tapCandidate = false
+              private var downX = 0f
+              private var downY = 0f
+              private var boxStart: PointF? = null
+              private var boxEnd: PointF? = null
+              private var overTrash = false
+
+              private fun sx(): Float = width.toFloat() / bmp.width
+              private fun sy(): Float = height.toFloat() / bmp.height
+
+              override fun onDraw(cv: Canvas) {
+                  val sx = sx()
+                  val sy = sy()
+                  val d = context.dpf(1f)
+                  cv.drawBitmap(bmp, null, RectF(0f, 0f, width.toFloat(), height.toFloat()), null)
+                  cv.drawColor(0x66000000)
+
+                  // targets that are visible on this screen
+                  for (f in found) {
+                      val box = RectF(f.l * sx, f.top * sy, f.r * sx, f.b * sy)
+                      strokeP.color = if (f.t.enabled) Theme.GOLD else Theme.MUTED
+                      strokeP.strokeWidth = 2.5f * d
+                      cv.drawRoundRect(box, 6 * d, 6 * d, strokeP)
+
+                      val label = "${f.t.name} ${(f.score * 100).toInt()}%"
+                      textP.textSize = 12 * d
+                      textP.color = Theme.TEXT
+                      val tw = textP.measureText(label) + 14 * d
+                      fillP.color = 0xCC000000.toInt()
+                      cv.drawRoundRect(RectF(box.left, box.top - 24 * d, box.left + tw, box.top - 3 * d), 6 * d, 6 * d, fillP)
+                      cv.drawText(label, box.left + tw / 2, box.top - 9 * d, textP)
+
+                      val cx = f.clickX() * sx
+                      val cy = f.clickY() * sy
+                      fillP.color = Theme.GOLD
+                      cv.drawCircle(cx, cy, 9 * d, fillP)
+                      strokeP.color = Color.WHITE
+                      strokeP.strokeWidth = 2 * d
+                      cv.drawCircle(cx, cy, 9 * d, strokeP)
+                      strokeP.color = Theme.GOLD
+                      cv.drawLine(cx - 18 * d, cy, cx - 12 * d, cy, strokeP); cv.drawLine(cx + 12 * d, cy, cx + 18 * d, cy, strokeP)
+                      cv.drawLine(cx, cy - 18 * d, cx, cy - 12 * d, strokeP); cv.drawLine(cx, cy + 12 * d, cx, cy + 18 * d, strokeP)
+                  }
+
+                  // tap points
+                  points.forEachIndexed { i, p ->
+                      val x = p.x * sx
+                      val y = p.y * sy
+                      fillP.color = Theme.ACCENT
+                      cv.drawCircle(x, y, 15 * d, fillP)
+                      strokeP.color = Color.WHITE
+                      strokeP.strokeWidth = 2.5f * d
+                      cv.drawCircle(x, y, 15 * d, strokeP)
+                      textP.textSize = 14 * d
+                      textP.color = Color.WHITE
+                      cv.drawText("${i + 1}", x, y + 5 * d, textP)
+                  }
+
+                  // box being drawn
+                  val a = boxStart
+                  val b = boxEnd
+                  if (mode == 1 && a != null && b != null) {
+                      strokeP.color = Theme.GOLD
+                      strokeP.strokeWidth = 3 * d
+                      cv.drawRect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y), strokeP)
+                  }
+
+                  // trash zone while dragging a point
+                  if (dragPoint >= 0) {
+                      fillP.color = if (overTrash) 0xCCF87171.toInt() else 0x99000000.toInt()
+                      cv.drawRoundRect(RectF(width * 0.25f, height - 110 * d, width * 0.75f, height - 40 * d), 18 * d, 18 * d, fillP)
+                      Ic.draw(cv, Ic.TRASH, iconP, Theme.TEXT, width / 2f - 16 * d, height - 92 * d, 32 * d)
+                  }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val sx = sx()
+                  val sy = sy()
+                  val d = context.dpf(1f)
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          downX = e.x; downY = e.y
+                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
+                          if (mode == 0) {
+                              for (i in points.indices.reversed()) {
+                                  val p = points[i]
+                                  if (hypot(e.x - p.x * sx, e.y - p.y * sy) < 30 * d) { dragPoint = i; break }
+                              }
+                              if (dragPoint < 0) {
+                                  for (i in found.indices.reversed()) {
+                                      val f = found[i]
+                                      if (hypot(e.x - f.clickX() * sx, e.y - f.clickY() * sy) < 26 * d) { dragDot = i; break }
+                                  }
+                              }
+                              if (dragPoint < 0 && dragDot < 0) tapCandidate = true
+                          } else {
+                              boxStart = PointF(e.x, e.y)
+                              boxEnd = PointF(e.x, e.y)
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (hypot(e.x - downX, e.y - downY) > 10 * d) tapCandidate = false
+                          if (dragPoint >= 0) {
+                              points[dragPoint].set(
+                                  (e.x / sx).coerceIn(0f, bmp.width - 1f),
+                                  (e.y / sy).coerceIn(0f, bmp.height - 1f)
+                              )
+                              overTrash = e.y > height - 130 * d
+                          } else if (dragDot >= 0) {
+                              val f = found[dragDot]
+                              f.t.fx = ((e.x / sx - f.l) / (f.r - f.l)).coerceIn(-0.2f, 1.2f)
+                              f.t.fy = ((e.y / sy - f.top) / (f.b - f.top)).coerceIn(-0.2f, 1.2f)
+                          } else if (mode == 1) {
+                              boxEnd = PointF(e.x, e.y)
+                          }
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (dragPoint >= 0) {
+                              if (overTrash) points.removeAt(dragPoint)
+                          } else if (dragDot >= 0) {
+                              // offset already updated while dragging
+                          } else if (mode == 0 && tapCandidate) {
+                              points.add(PointF((e.x / sx).coerceIn(0f, bmp.width - 1f), (e.y / sy).coerceIn(0f, bmp.height - 1f)))
+                          } else if (mode == 1) {
+                              val a = boxStart
+                              val b = boxEnd
+                              if (a != null && b != null) {
+                                  onBox?.invoke(RectF(min(a.x, b.x) / sx, min(a.y, b.y) / sy, max(a.x, b.x) / sx, max(a.y, b.y) / sy))
+                              }
+                              boxStart = null; boxEnd = null
+                          }
+                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
+                          boxStart = null; boxEnd = null
+                      }
+                  }
+                  invalidate()
+                  return true
+              }
+          }
+
+          /** Transparent overlay that shows numbered rings where the farm taps land. */
+          class MarkersView(c: Context, private val size: () -> Pair<Int, Int>) : View(c) {
+              private val fillP = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+              private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  typeface = Typeface.DEFAULT_BOLD
+                  color = Color.WHITE
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val d = context.dpf(1f)
+                  val sz = size()
+                  val kx = width.toFloat() / sz.first
+                  val ky = height.toFloat() / sz.second
+                  Store.points(context).forEachIndexed { i, p ->
+                      val x = p.first * kx
+                      val y = p.second * ky
+                      fillP.color = 0x667C5CFF
+                      cv.drawCircle(x, y, 16 * d, fillP)
+                      strokeP.color = Color.WHITE
+                      strokeP.strokeWidth = 2 * d
+                      cv.drawCircle(x, y, 16 * d, strokeP)
+                      textP.textSize = 13 * d
+                      cv.drawText("${i + 1}", x, y + 4.5f * d, textP)
+                  }
+              }
           }
           IC_EOF
           mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerAccessibility.kt)
@@ -179,6 +938,7 @@ jobs:
 
           import android.accessibilityservice.AccessibilityService
           import android.accessibilityservice.GestureDescription
+          import android.content.Intent
           import android.graphics.Path
           import android.view.accessibility.AccessibilityEvent
           import java.util.concurrent.CountDownLatch
@@ -192,10 +952,17 @@ jobs:
               }
 
               override fun onServiceConnected() { instance = this }
-              override fun onUnbind(intent: android.content.Intent?): Boolean {
+
+              override fun onUnbind(intent: Intent?): Boolean {
                   instance = null
                   return super.onUnbind(intent)
               }
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
               override fun onInterrupt() {}
 
@@ -203,7 +970,7 @@ jobs:
               fun tap(x: Float, y: Float) {
                   val path = Path().apply { moveTo(x, y) }
                   val gesture = GestureDescription.Builder()
-                      .addStroke(GestureDescription.StrokeDescription(path, 0, 10))
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 25))
                       .build()
                   val latch = CountDownLatch(1)
                   val ok = dispatchGesture(gesture, object : GestureResultCallback() {
@@ -211,123 +978,6 @@ jobs:
                       override fun onCancelled(g: GestureDescription?) { latch.countDown() }
                   }, null)
                   if (ok) latch.await(300, TimeUnit.MILLISECONDS)
-              }
-          }
-          IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/MainActivity.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/MainActivity.kt <<'IC_EOF'
-          package com.autoclicker.imageclicker
-
-          import android.app.Activity
-          import android.content.Intent
-          import android.media.projection.MediaProjectionManager
-          import android.net.Uri
-          import android.os.Build
-          import android.os.Bundle
-          import android.provider.Settings
-          import android.widget.Button
-          import android.widget.LinearLayout
-          import android.widget.ScrollView
-          import android.widget.SeekBar
-          import android.widget.TextView
-          import android.widget.Toast
-
-          class MainActivity : Activity() {
-
-              private lateinit var status: TextView
-              private val REQ_CAPTURE = 1
-
-              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  if (Build.VERSION.SDK_INT >= 33) {
-                      requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 0)
-                  }
-
-                  val root = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setPadding(dp(16), dp(16), dp(16), dp(16))
-                  }
-                  fun text(t: String, size: Float = 16f) = TextView(this).apply {
-                      text = t; textSize = size; setPadding(0, dp(6), 0, dp(6))
-                  }.also { root.addView(it) }
-                  fun button(t: String, a: () -> Unit) = Button(this).apply {
-                      text = t; setOnClickListener { a() }
-                  }.also { root.addView(it) }
-
-                  text("Image Clicker", 28f)
-                  text("Auto-farm taps + auto-click on pictures (Claim, ❌, Skip, Close).")
-                  status = text("")
-
-                  button("1. Enable Accessibility service") {
-                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                      Toast.makeText(this, "Open 'Image Clicker' and turn it ON", Toast.LENGTH_LONG).show()
-                  }
-                  button("2. Allow display over other apps") {
-                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-                  }
-
-                  val cpsLabel = text("Taps per second: ${Store.cps(this)}")
-                  root.addView(SeekBar(this).apply {
-                      max = 25
-                      progress = Store.cps(this@MainActivity) - 5
-                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
-                              Store.setCps(this@MainActivity, p + 5)
-                              cpsLabel.text = "Taps per second: ${p + 5}"
-                          }
-                          override fun onStartTrackingTouch(s: SeekBar?) {}
-                          override fun onStopTrackingTouch(s: SeekBar?) {}
-                      })
-                  })
-
-                  button("3. Start") { start() }
-                  button("Stop") { stopService(Intent(this, ClickerService::class.java)) }
-
-                  text(
-                      "\nHOW TO USE\n" +
-                      "• Press Start, then choose 'Entire screen' and allow.\n" +
-                      "• Open your game. A small floating bar appears.\n" +
-                      "• ➕  Add target (unlimited): drag a box around a button (Claim, ❌, Skip, Close). Repeat for each one.\n" +
-                      "• 🎯  Add tap point (unlimited): touch a spot to farm. Several points are tapped in turn.\n" +
-                      "• ▶  Start / ⏸ pause.   ✥ Move bar.   ✕ Exit.\n" +
-                      "• Tap 🗑 = delete last target, hold 🗑 = delete all.  Hold 🎯 = clear tap points.\n\n" +
-                      "Whenever a saved target is seen on screen, it is clicked first. Otherwise the app keeps tapping the tap point."
-                  )
-
-                  setContentView(ScrollView(this).apply { addView(root) })
-              }
-
-              override fun onResume() {
-                  super.onResume()
-                  val acc = if (ClickerAccessibility.instance != null) "✅" else "❌"
-                  val ovl = if (Settings.canDrawOverlays(this)) "✅" else "❌"
-                  status.text = "Accessibility: $acc     Overlay permission: $ovl"
-              }
-
-              private fun start() {
-                  if (ClickerAccessibility.instance == null) {
-                      Toast.makeText(this, "Enable the Accessibility service first (step 1)", Toast.LENGTH_LONG).show(); return
-                  }
-                  if (!Settings.canDrawOverlays(this)) {
-                      Toast.makeText(this, "Allow overlay first (step 2)", Toast.LENGTH_LONG).show(); return
-                  }
-                  val mpm = getSystemService(MediaProjectionManager::class.java)
-                  @Suppress("DEPRECATION")
-                  startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE)
-              }
-
-              @Suppress("DEPRECATION")
-              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-                  super.onActivityResult(requestCode, resultCode, data)
-                  if (requestCode == REQ_CAPTURE && resultCode == RESULT_OK && data != null) {
-                      val i = Intent(this, ClickerService::class.java)
-                          .putExtra("code", resultCode)
-                          .putExtra("data", data)
-                      startForegroundService(i)
-                      moveTaskToBack(true)
-                  }
               }
           }
           IC_EOF
@@ -342,14 +992,11 @@ jobs:
           import android.app.Service
           import android.content.Context
           import android.content.Intent
+          import android.content.res.Configuration
           import android.content.pm.ServiceInfo
           import android.graphics.Bitmap
-          import android.graphics.BitmapFactory
-          import android.graphics.Canvas
-          import android.graphics.Color
-          import android.graphics.Paint
           import android.graphics.PixelFormat
-          import android.graphics.RectF
+          import android.graphics.PointF
           import android.hardware.display.DisplayManager
           import android.hardware.display.VirtualDisplay
           import android.media.ImageReader
@@ -364,33 +1011,45 @@ jobs:
           import android.view.Gravity
           import android.view.MotionEvent
           import android.view.View
-          import android.view.ViewGroup
           import android.view.WindowManager
-          import android.widget.Button
           import android.widget.FrameLayout
-          import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.TextView
           import android.widget.Toast
           import org.opencv.android.OpenCVLoader
           import org.opencv.android.Utils
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.TextRecognizer
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
           import org.opencv.core.Core
+          import org.opencv.core.CvType
           import org.opencv.core.Mat
           import org.opencv.core.Size
           import org.opencv.imgproc.Imgproc
-          import java.io.File
-          import java.io.FileOutputStream
-          import kotlin.math.max
-          import kotlin.math.min
+          import java.util.concurrent.TimeUnit
 
           class ClickerService : Service() {
 
               companion object {
                   const val ACTION_STOP = "com.autoclicker.imageclicker.STOP"
                   private const val CHANNEL = "clicker"
-                  private const val SCALE = 0.5      // match on half-size images (faster)
-                  private const val THRESHOLD = 0.80 // 0..1, lower = more tolerant
-                  private const val SCAN_EVERY_MS = 500L
+                  private const val SCALE = 0.5 // match on half-size images (faster)
+                  @Volatile var instance: ClickerService? = null
+              }
+
+              /** One scaled copy of a target picture: grayscale + gradient (shape) map. */
+              private class Var(val gray: Mat, val grad: Mat)
+
+              private class Tpl(val t: Target, val vars: List<Var>) {
+                  fun release() { vars.forEach { it.gray.release(); it.grad.release() } }
+              }
+
+              /** Current screenshot prepared for matching (gradient map is built only when needed). */
+              private class Frm(val gray: Mat) {
+                  var grad: Mat? = null
+                  fun release() { gray.release(); grad?.release() }
               }
 
               private lateinit var wm: WindowManager
@@ -404,17 +1063,60 @@ jobs:
               private var lastFrame: Bitmap? = null
 
               private var panel: View? = null
-              private var picker: View? = null
-              private var playBtn: TextView? = null
+              private var markers: View? = null
+              private var editor: View? = null
+              private var quick: View? = null
+              private var playIcon: IconView? = null
+              private var playWrap: View? = null
+              private var eyeIcon: IconView? = null
 
               @Volatile private var running = false
-              private var worker: Thread? = null
-              @Volatile private var templates: List<Mat> = emptyList()
+              @Volatile private var gen = 0
+              @Volatile private var hit: Pair<Float, Float>? = null
+              @Volatile private var holdUntil = 0L
+              @Volatile private var templates: List<Tpl> = emptyList()
+              private var recognizer: TextRecognizer? = null
 
               override fun onBind(intent: Intent?): IBinder? = null
 
-              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-              private fun toast(t: String) = ui.post { Toast.makeText(this, t, Toast.LENGTH_SHORT).show() }
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              }
+
+              private fun toast(t: String) { ui.post { Toast.makeText(this, t, Toast.LENGTH_SHORT).show() } }
+
+              /** Called by the app after profiles / targets changed. */
+              fun reload() {
+                  ui.post {
+                      loadTemplates()
+                      markers?.invalidate()
+                  }
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  ui.postDelayed({ rebuildCapture() }, 400)
+              }
+
+              /** Screen rotated: resize the capture so screenshots and taps stay aligned. */
+              @Suppress("DEPRECATION")
+              private fun rebuildCapture() {
+                  val d = display ?: return
+                  val dm = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  if (dm.widthPixels == sw && dm.heightPixels == sh) return
+                  sw = dm.widthPixels
+                  sh = dm.heightPixels
+                  val rd = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
+                  val old = reader
+                  synchronized(this) { reader = rd; lastFrame = null }
+                  d.resize(sw, sh, dm.densityDpi)
+                  d.surface = rd.surface
+                  old?.close()
+                  markers?.invalidate()
+              }
 
               @Suppress("DEPRECATION")
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -422,7 +1124,6 @@ jobs:
                   if (projection != null) return START_NOT_STICKY
 
                   startForegroundCompat()
-                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
                   if (!OpenCVLoader.initLocal()) { toast("OpenCV failed to load"); stopSelf(); return START_NOT_STICKY }
 
@@ -431,23 +1132,27 @@ jobs:
                   if (data == null) { stopSelf(); return START_NOT_STICKY }
 
                   val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                  projection = mpm.getMediaProjection(code, data)
-                  projection!!.registerCallback(object : MediaProjection.Callback() {
+                  val mp = mpm.getMediaProjection(code, data)
+                  projection = mp
+                  mp.registerCallback(object : MediaProjection.Callback() {
                       override fun onStop() { ui.post { stopSelf() } }
                   }, ui)
 
                   val dm = DisplayMetrics()
                   wm.defaultDisplay.getRealMetrics(dm)
-                  sw = dm.widthPixels; sh = dm.heightPixels
-                  reader = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
-                  display = projection!!.createVirtualDisplay(
+                  sw = dm.widthPixels
+                  sh = dm.heightPixels
+                  val rd = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
+                  reader = rd
+                  display = mp.createVirtualDisplay(
                       "clicker", sw, sh, dm.densityDpi,
-                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, null
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null
                   )
 
                   loadTemplates()
+                  applyMarkers()
                   showPanel()
-                  toast("Ready. Add targets with ➕ then press ▶")
+                  toast("Ready. Open your game and use the floating bar.")
                   return START_NOT_STICKY
               }
 
@@ -460,7 +1165,7 @@ jobs:
                   )
                   val n = Notification.Builder(this, CHANNEL)
                       .setContentTitle("Image Clicker is running")
-                      .setContentText("Tap to stop")
+                      .setContentText("Tap this notification to stop")
                       .setSmallIcon(android.R.drawable.ic_media_play)
                       .setContentIntent(stop)
                       .build()
@@ -486,9 +1191,7 @@ jobs:
                   return lastFrame
               }
 
-              // ---------------------------------------------------------------- targets
-
-              private fun targetsDir() = File(filesDir, "targets").apply { mkdirs() }
+              // ---------------------------------------------------------------- matching
 
               private fun toGray(b: Bitmap): Mat {
                   val m = Mat()
@@ -498,65 +1201,172 @@ jobs:
                   return m
               }
 
-              private fun loadTemplates() {
-                  val old = templates
-                  val files = targetsDir().listFiles { f -> f.extension == "png" }?.sortedBy { it.name } ?: emptyList()
-                  templates = files.mapNotNull { f -> BitmapFactory.decodeFile(f.path)?.let { toGray(it) } }
-                  old.forEach { it.release() }
+              /** Edge strength map: matches the SHAPE even when colours or brightness differ. */
+              private fun gradient(gray: Mat): Mat {
+                  val g = Mat()
+                  gray.convertTo(g, CvType.CV_32F)
+                  val gx = Mat()
+                  val gy = Mat()
+                  Imgproc.Sobel(g, gx, CvType.CV_32F, 1, 0, 3)
+                  Imgproc.Sobel(g, gy, CvType.CV_32F, 0, 1, 3)
+                  val mag = Mat()
+                  Core.magnitude(gx, gy, mag)
+                  g.release(); gx.release(); gy.release()
+                  return mag
               }
 
-              /** Returns screen coordinates of the first target found, or null. */
-              private fun scan(): Pair<Float, Float>? {
+              private fun makeTpl(t: Target, bmp: Bitmap): Tpl {
+                  val g = toGray(bmp)
+                  val vars = ArrayList<Var>()
+                  vars.add(Var(g, gradient(g)))
+                  if (Store.flex(this)) {
+                      // same picture a bit smaller / bigger
+                      for (s in listOf(0.8, 1.25, 0.65, 1.5)) {
+                          val o = Mat()
+                          Imgproc.resize(g, o, Size(), s, s, if (s < 1.0) Imgproc.INTER_AREA else Imgproc.INTER_LINEAR)
+                          if (o.cols() < 8 || o.rows() < 8) { o.release(); continue }
+                          vars.add(Var(o, gradient(o)))
+                      }
+                  }
+                  return Tpl(t, vars)
+              }
+
+              private fun loadTemplates() {
+                  templates = Targets.list(this).filter { it.enabled }.mapNotNull { t ->
+                      Targets.bitmap(this, t)?.let { makeTpl(t, it) }
+                  }
+              }
+
+              private fun matchMat(src: Mat, tpl: Mat, t: Target): Found? {
+                  if (tpl.cols() > src.cols() || tpl.rows() > src.rows()) return null
+                  val r = Mat()
+                  Imgproc.matchTemplate(src, tpl, r, Imgproc.TM_CCOEFF_NORMED)
+                  val mm = Core.minMaxLoc(r)
+                  r.release()
+                  val x = mm.maxLoc.x
+                  val y = mm.maxLoc.y
+                  return Found(
+                      t,
+                      (x / SCALE).toFloat(), (y / SCALE).toFloat(),
+                      ((x + tpl.cols()) / SCALE).toFloat(), ((y + tpl.rows()) / SCALE).toFloat(),
+                      mm.maxVal
+                  )
+              }
+
+              /**
+               * 1) exact look (grayscale, original size)
+               * 2) if flex: same shape in other sizes / colours (edge map at several scales)
+               */
+              private fun matchTpl(frame: Frm, tpl: Tpl, thr: Double, flex: Boolean): Found? {
+                  var best = matchMat(frame.gray, tpl.vars[0].gray, tpl.t)
+                  if (best != null && best.score >= thr) return best
+                  if (flex) {
+                      val fg = frame.grad ?: gradient(frame.gray).also { frame.grad = it }
+                      for (v in tpl.vars) {
+                          val f = matchMat(fg, v.grad, tpl.t) ?: continue
+                          if (f.score >= thr) return f
+                          if (best == null || f.score > best.score) best = f
+                      }
+                  }
+                  return best
+              }
+
+              /** Click position of the first picture target seen on screen, or null. */
+              private fun scanPictures(flex: Boolean): Pair<Float, Float>? {
                   val tpls = templates
                   if (tpls.isEmpty()) return null
-                  val frame = grab() ?: return null
-                  val m = toGray(frame)
+                  val bmp = grab() ?: return null
+                  val frame = Frm(toGray(bmp))
                   try {
+                      val thr = Store.threshold(this) / 100.0
                       for (t in tpls) {
-                          if (t.cols() > m.cols() || t.rows() > m.rows()) continue
-                          val r = Mat()
-                          Imgproc.matchTemplate(m, t, r, Imgproc.TM_CCOEFF_NORMED)
-                          val mm = Core.minMaxLoc(r)
-                          r.release()
-                          if (mm.maxVal >= THRESHOLD) {
-                              val x = ((mm.maxLoc.x + t.cols() / 2.0) / SCALE).toFloat()
-                              val y = ((mm.maxLoc.y + t.rows() / 2.0) / SCALE).toFloat()
-                              return Pair(x, y)
-                          }
+                          val f = matchTpl(frame, t, thr, flex) ?: continue
+                          if (f.score >= thr) return Pair(f.clickX(), f.clickY())
                       }
-                  } finally { m.release() }
+                  } finally { frame.release() }
                   return null
               }
 
-              // ---------------------------------------------------------------- main loop
+              /** Reads the screen text (offline OCR) and returns the centre of the first enabled word found. */
+              private fun scanText(): Pair<Float, Float>? {
+                  val words = Store.words(this).filter { it.second }.map { it.first.trim().lowercase() }.filter { it.isNotEmpty() }
+                  if (words.isEmpty()) return null
+                  val bmp = grab() ?: return null
+                  val rec = recognizer ?: TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).also { recognizer = it }
+                  val res = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)), 4, TimeUnit.SECONDS)
+                  for (block in res.textBlocks) {
+                      for (line in block.lines) {
+                          val txt = line.text.trim().lowercase()
+                          val box = line.boundingBox ?: continue
+                          for (w in words) {
+                              if (txt == w || (txt.contains(w) && txt.length <= w.length + 8)) {
+                                  return Pair(box.exactCenterX(), box.exactCenterY())
+                              }
+                          }
+                      }
+                  }
+                  return null
+              }
+
+              /** Every picture target (enabled or not) visible in this screenshot, for the editor. */
+              private fun matchAll(frameBmp: Bitmap, list: List<Target>): List<Found> {
+                  val frame = Frm(toGray(frameBmp))
+                  val thr = Store.threshold(this) / 100.0
+                  val out = ArrayList<Found>()
+                  try {
+                      for (t in list) {
+                          val bmp = Targets.bitmap(this, t) ?: continue
+                          val tpl = makeTpl(t, bmp)
+                          val f = matchTpl(frame, tpl, thr, Store.flex(this))
+                          tpl.release()
+                          if (f != null && f.score >= thr) out.add(f)
+                      }
+                  } finally { frame.release() }
+                  return out
+              }
+
+              // ---------------------------------------------------------------- main loops
+
+              private fun updatePlay() {
+                  playIcon?.kind = if (running) Ic.PAUSE else Ic.PLAY
+                  playIcon?.invalidate()
+                  playWrap?.background = if (running) rounded(Theme.ACCENT, dpf(14f)) else null
+              }
 
               private fun setRunning(on: Boolean) {
                   if (on == running) return
                   if (on) {
-                      if (ClickerAccessibility.instance == null) { toast("Accessibility service is OFF"); return }
+                      if (ClickerAccessibility.instance == null) { toast("Accessibility service is OFF. Open the app."); return }
                       running = true
-                      worker = Thread { loop() }.also { it.start() }
+                      hit = null
+                      holdUntil = 0L
+                      val g = ++gen
+                      Thread { tapLoop(g) }.start()
+                      Thread { scanLoop(g) }.start()
                   } else {
                       running = false
+                      gen++
                   }
-                  playBtn?.text = if (running) "⏸" else "▶"
+                  updatePlay()
               }
 
-              private fun loop() {
-                  var lastScan = 0L
+              /** Taps: a found button first, otherwise the farm tap points in turn. */
+              private fun tapLoop(g: Int) {
                   var idx = 0
-                  while (running) {
+                  while (running && g == gen) {
                       val acc = ClickerAccessibility.instance
-                      if (acc == null) { SystemClock.sleep(500); continue }
-                      val now = SystemClock.uptimeMillis()
-                      if (now - lastScan >= SCAN_EVERY_MS) {
-                          lastScan = now
-                          val hit = try { scan() } catch (e: Exception) { null }
-                          if (hit != null) {
-                              acc.tap(hit.first, hit.second)
-                              SystemClock.sleep(800)
-                              continue
-                          }
+                      if (acc == null) {
+                          running = false
+                          ui.post { updatePlay(); toast("Accessibility got turned off. Re-enable it in the app.") }
+                          return
+                      }
+                      val h = hit
+                      if (h != null) {
+                          hit = null
+                          holdUntil = SystemClock.uptimeMillis() + 1000
+                          acc.tap(h.first, h.second)
+                          SystemClock.sleep(700)
+                          continue
                       }
                       val pts = Store.points(this)
                       val pt = if (pts.isEmpty()) Pair(sw / 2f, sh / 2f) else pts[idx++ % pts.size]
@@ -565,385 +1375,1134 @@ jobs:
                   }
               }
 
-              // ---------------------------------------------------------------- floating bar
+              /** Looks at the screen in parallel, so farming never slows down. */
+              private fun scanLoop(g: Int) {
+                  var n = 0
+                  var lastText = 0L
+                  while (running && g == gen) {
+                      val now = SystemClock.uptimeMillis()
+                      if (hit == null && now >= holdUntil) {
+                          // exact look every scan, flexible (shape) matching every 3rd scan: lighter on battery
+                          val flex = Store.flex(this) && n % 3 == 0
+                          var found: Pair<Float, Float>? = try { scanPictures(flex) } catch (e: Throwable) { null }
+                          if (found == null && now - lastText >= Store.textMs(this)) {
+                              lastText = now
+                              found = try { scanText() } catch (e: Throwable) { null }
+                          }
+                          if (found != null && g == gen) hit = found
+                          n++
+                      }
+                      SystemClock.sleep(Store.scanMs(this))
+                  }
+              }
+
+              // ---------------------------------------------------------------- overlays
 
               private fun overlayType() = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+              private fun fullScreenParams(touchable: Boolean): WindowManager.LayoutParams {
+                  var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                  if (!touchable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                      overlayType(), flags, PixelFormat.TRANSLUCENT
+                  )
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  }
+                  return lp
+              }
+
+              private fun applyMarkers() {
+                  if (markers == null) {
+                      val v = MarkersView(this) { Pair(sw, sh) }
+                      wm.addView(v, fullScreenParams(false))
+                      markers = v
+                  }
+                  markers?.visibility = if (Store.markers(this)) View.VISIBLE else View.GONE
+                  markers?.invalidate()
+                  eyeIcon?.color = if (Store.markers(this)) Theme.GOLD else Theme.ICON
+                  eyeIcon?.invalidate()
+              }
+
+              private fun barButton(kind: Int, onClick: () -> Unit): FrameLayout {
+                  val icon = IconView(this, kind)
+                  return FrameLayout(this).apply {
+                      addView(icon, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+                      layoutParams = LinearLayout.LayoutParams(dp(46), dp(46))
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                  }
+              }
 
               private fun showPanel() {
                   val lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
                       overlayType(), WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
-                  ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = dp(200) }
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = dp(4); y = dp(180) }
 
                   val col = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(0xCC1B1340.toInt())
+                      background = rounded(0xEE1C1445.toInt(), dpf(24f), Theme.ACCENT, dp(1))
+                      setPadding(dp(3), dp(4), dp(3), dp(4))
                   }
-                  fun btn(t: String, onLong: (() -> Unit)? = null, onClick: () -> Unit) = TextView(this).apply {
-                      text = t; textSize = 22f; gravity = Gravity.CENTER
-                      setTextColor(Color.WHITE); setPadding(dp(10), dp(8), dp(10), dp(8))
-                      setOnClickListener { onClick() }
-                      if (onLong != null) setOnLongClickListener { onLong(); true }
-                  }.also { col.addView(it) }
 
                   // drag handle
-                  val handle = btn("✥") { }
+                  val grip = barButton(Ic.GRIP) {}
                   var dx = 0f; var dy = 0f; var sx = 0; var sy = 0
-                  handle.setOnTouchListener { _, e ->
+                  grip.setOnTouchListener { _, e ->
                       when (e.action) {
                           MotionEvent.ACTION_DOWN -> { dx = e.rawX; dy = e.rawY; sx = lp.x; sy = lp.y }
                           MotionEvent.ACTION_MOVE -> {
-                              lp.x = sx + (e.rawX - dx).toInt(); lp.y = sy + (e.rawY - dy).toInt()
+                              lp.x = sx + (e.rawX - dx).toInt()
+                              lp.y = sy + (e.rawY - dy).toInt()
                               wm.updateViewLayout(col, lp)
                           }
                       }
                       true
                   }
-                  playBtn = btn("▶") { setRunning(!running) }
-                  btn("🎯", { Store.clearPoints(this); toast("All tap points cleared") }) { openPicker(true) }
-                  btn("➕") { openPicker(false) }
-                  btn("🗑", {
-                      targetsDir().listFiles()?.forEach { it.delete() }
-                      loadTemplates(); toast("All targets deleted")
-                  }) {
-                      targetsDir().listFiles()?.sortedBy { it.name }?.lastOrNull()?.delete()
-                      loadTemplates(); toast("Last target deleted (${templates.size} left)")
+                  col.addView(grip)
+
+                  val play = barButton(Ic.PLAY) { setRunning(!running) }
+                  playWrap = play
+                  playIcon = play.getChildAt(0) as IconView
+                  col.addView(play)
+
+                  col.addView(barButton(Ic.PENCIL) { openEditor() })
+
+                  val eye = barButton(Ic.EYE) {
+                      Store.setMarkers(this, !Store.markers(this))
+                      applyMarkers()
                   }
-                  btn("✕") { stopSelf() }
+                  eyeIcon = eye.getChildAt(0) as IconView
+                  col.addView(eye)
+
+                  col.addView(barButton(Ic.SLIDERS) { openQuick() })
+                  col.addView(barButton(Ic.CLOSE) { stopSelf() })
 
                   wm.addView(col, lp)
                   panel = col
+                  applyMarkers() // refresh eye colour
               }
 
-              // ---------------------------------------------------------------- picker (freeze screen, choose area/point)
-
-              private class SelView(
-                  c: Context,
-                  private val onDone: (RectF, Int, Int) -> Unit
-              ) : View(c) {
-                  private val paint = Paint().apply { color = 0xFF00E5FF.toInt(); style = Paint.Style.STROKE; strokeWidth = 6f }
-                  private var x0 = 0f; private var y0 = 0f; private var x1 = 0f; private var y1 = 0f
-                  private var drawing = false
-
-                  override fun onTouchEvent(e: MotionEvent): Boolean {
-                      when (e.action) {
-                          MotionEvent.ACTION_DOWN -> { x0 = e.x; y0 = e.y; x1 = x0; y1 = y0; drawing = true }
-                          MotionEvent.ACTION_MOVE -> { x1 = e.x; y1 = e.y }
-                          MotionEvent.ACTION_UP -> {
-                              x1 = e.x; y1 = e.y; drawing = false
-                              onDone(RectF(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)), width, height)
-                          }
-                      }
-                      invalidate()
-                      return true
-                  }
-
-                  override fun onDraw(canvas: Canvas) {
-                      if (drawing) canvas.drawRect(x0, y0, x1, y1, paint)
-                  }
-              }
-
-              private fun closePicker() {
-                  picker?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  picker = null
+              private fun restoreUi() {
                   panel?.visibility = View.VISIBLE
+                  applyMarkers()
               }
 
-              private fun openPicker(pointMode: Boolean) {
-                  if (picker != null) return
+              // ---------------------------------------------------------------- quick settings
+
+              private fun closeQuick() {
+                  quick?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  quick = null
+              }
+
+              private fun openQuick() {
+                  if (quick != null || editor != null) return
                   setRunning(false)
-                  SystemClock.sleep(150)
+                  val card = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = rounded(0xF01C1445.toInt(), dpf(18f), Theme.ACCENT, dp(1))
+                      setPadding(dp(18), dp(14), dp(18), dp(14))
+                  }
+                  card.addView(Ui.text(this, "Quick settings", 18f, Theme.TEXT, true))
+                  Ui.slider(this, card, "Taps per second", 5, 30, 1, Store.cps(this), "") { Store.setCps(this, it) }
+                  Ui.slider(this, card, "Match sensitivity (lower = more tolerant)", 60, 95, 1, Store.threshold(this), "%") { Store.setThreshold(this, it) }
+                  Ui.slider(this, card, "Look for targets every", 200, 2000, 100, Store.scanMs(this).toInt(), " ms") { Store.setScanMs(this, it) }
+                  card.addView(Ui.gap(this, 10))
+                  card.addView(Ui.button(this, "Close", false) { closeQuick() })
+                  val lp = WindowManager.LayoutParams(
+                      (sw * 0.88).toInt(), WindowManager.LayoutParams.WRAP_CONTENT,
+                      overlayType(), WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.CENTER }
+                  wm.addView(card, lp)
+                  quick = card
+              }
+
+              // ---------------------------------------------------------------- editor
+
+              private fun closeEditor() {
+                  editor?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  editor = null
+                  restoreUi()
+              }
+
+              private fun openEditor() {
+                  if (editor != null) return
+                  setRunning(false)
+                  closeQuick()
+                  // hide our own overlays so they are not in the frozen screenshot
+                  panel?.visibility = View.GONE
+                  markers?.visibility = View.GONE
+                  ui.postDelayed({ buildEditor() }, 300)
+              }
+
+              private fun buildEditor() {
                   val frame = grab()
-                  if (frame == null) { toast("No screen image yet, try again"); return }
+                  if (frame == null) { toast("No screen image yet, try again"); restoreUi(); return }
+
+                  val targets = Targets.list(this).toMutableList()
+                  val pts = Store.points(this).map { PointF(it.first, it.second) }.toMutableList()
+                  val view = EditorView(this, frame, pts, emptyList())
+                  val hint = Ui.text(this, "", 13f, Theme.TEXT).apply {
+                      background = rounded(0xCC0F0A28.toInt(), dpf(12f))
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                  }
+                  var chipP: TextView? = null
+                  var chipT: TextView? = null
+                  var visible = 0
+
+                  fun setMode(m: Int) {
+                      view.mode = m
+                      chipP?.background = rounded(if (m == 0) Theme.ACCENT else Theme.CARD2, dpf(14f))
+                      chipT?.background = rounded(if (m == 1) Theme.ACCENT else Theme.CARD2, dpf(14f))
+                      hint.text = if (m == 0) {
+                          "Tap empty space: add a tap point. Drag a point to move it, drop it on the trash to delete. " +
+                              "Drag a gold dot to change where a target is clicked. ($visible of ${targets.size} targets visible now)"
+                      } else {
+                          "Drag a box tightly around the button you want to click."
+                      }
+                      view.invalidate()
+                  }
+
+                  fun rescan() {
+                      val snap = targets.toList()
+                      Thread {
+                          val found = try { matchAll(frame, snap) } catch (e: Exception) { emptyList() }
+                          ui.post {
+                              if (editor != null) {
+                                  view.found = found
+                                  visible = found.size
+                                  setMode(view.mode)
+                              }
+                          }
+                      }.start()
+                  }
+
+                  view.onBox = { r ->
+                      val l = r.left.toInt().coerceIn(0, frame.width - 1)
+                      val t = r.top.toInt().coerceIn(0, frame.height - 1)
+                      val rr = r.right.toInt().coerceIn(l + 1, frame.width)
+                      val bb = r.bottom.toInt().coerceIn(t + 1, frame.height)
+                      if (rr - l < 16 || bb - t < 16) {
+                          toast("Box too small, try again")
+                      } else {
+                          val crop = Bitmap.createBitmap(frame, l, t, rr - l, bb - t)
+                          val tg = Targets.createImage(this, crop)
+                          tg.name = "Target ${targets.size + 1}"
+                          targets.add(tg)
+                          Targets.saveAll(this, targets)
+                          loadTemplates()
+                          rescan()
+                          setMode(0)
+                          toast("Target added")
+                      }
+                  }
 
                   val root = FrameLayout(this)
-                  root.addView(ImageView(this).apply {
-                      setImageBitmap(frame); scaleType = ImageView.ScaleType.FIT_XY
-                  }, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                  root.addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-                  root.addView(SelView(this) { rect, vw, vh ->
-                      val fx = frame.width.toFloat() / vw
-                      val fy = frame.height.toFloat() / vh
-                      if (pointMode) {
-                          Store.addPoint(this, rect.centerX() * fx, rect.centerY() * fy)
-                          toast("Tap point added (${Store.points(this).size} total)")
-                          closePicker()
-                      } else {
-                          val l = (rect.left * fx).toInt().coerceIn(0, frame.width - 1)
-                          val t = (rect.top * fy).toInt().coerceIn(0, frame.height - 1)
-                          val r = (rect.right * fx).toInt().coerceIn(l + 1, frame.width)
-                          val b = (rect.bottom * fy).toInt().coerceIn(t + 1, frame.height)
-                          if (r - l < 16 || b - t < 16) {
-                              toast("Box too small, try again")
-                          } else {
-                              val crop = Bitmap.createBitmap(frame, l, t, r - l, b - t)
-                              FileOutputStream(File(targetsDir(), "t_${System.currentTimeMillis()}.png")).use {
-                                  crop.compress(Bitmap.CompressFormat.PNG, 100, it)
-                              }
-                              loadTemplates()
-                              toast("Target saved (${templates.size} total)")
-                              closePicker()
-                          }
-                      }
-                  }, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-
-                  root.addView(TextView(this).apply {
-                      text = if (pointMode) "Touch a spot to add a farm tap point"
-                             else "Drag a box tightly around the button"
-                      setTextColor(Color.WHITE); setBackgroundColor(0xAA000000.toInt())
-                      textSize = 16f; setPadding(dp(12), dp(8), dp(12), dp(8))
-                  }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                      Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(40) })
-
-                  root.addView(Button(this).apply {
-                      text = "Cancel"; setOnClickListener { closePicker() }
-                  }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                      Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(60) })
-
-                  val lp = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
-                      overlayType(),
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                      PixelFormat.TRANSLUCENT
-                  )
-                  if (Build.VERSION.SDK_INT >= 28) {
-                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  val bar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
                   }
-                  panel?.visibility = View.GONE
-                  wm.addView(root, lp)
-                  picker = root
+                  val cp = Ui.chip(this, "Points", true) { setMode(0) }
+                  val ct = Ui.chip(this, "New target", false) { setMode(1) }
+                  chipP = cp
+                  chipT = ct
+                  bar.addView(cp)
+                  bar.addView(View(this), LinearLayout.LayoutParams(dp(8), dp(1)))
+                  bar.addView(ct)
+                  bar.addView(View(this), LinearLayout.LayoutParams(0, dp(1), 1f))
+                  bar.addView(Ui.iconBtn(this, Ic.CLOSE) { closeEditor() })
+                  bar.addView(Ui.iconBtn(this, Ic.CHECK, Theme.GOLD) {
+                      Store.setPoints(this, pts.map { Pair(it.x, it.y) })
+                      Targets.saveAll(this, targets)
+                      loadTemplates()
+                      closeEditor()
+                      toast("Saved")
+                  })
+                  root.addView(bar, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP
+                  ).apply { topMargin = dp(36); leftMargin = dp(12); rightMargin = dp(12) })
+                  root.addView(hint, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP
+                  ).apply { topMargin = dp(92); leftMargin = dp(12); rightMargin = dp(12) })
+
+                  wm.addView(root, fullScreenParams(true))
+                  editor = root
+                  setMode(0)
+                  rescan()
               }
 
               // ---------------------------------------------------------------- cleanup
 
               override fun onDestroy() {
                   running = false
-                  picker?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  gen++
+                  editor?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  quick?.let { try { wm.removeView(it) } catch (_: Exception) {} }
                   panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  markers?.let { try { wm.removeView(it) } catch (_: Exception) {} }
                   display?.release()
                   reader?.close()
                   projection?.stop()
-                  templates.forEach { it.release() }
+                  try { recognizer?.close() } catch (_: Throwable) {}
+                  instance = null
                   super.onDestroy()
               }
           }
           IC_EOF
+          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/MainActivity.kt)
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/MainActivity.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var content: FrameLayout
+              private lateinit var nav: LinearLayout
+              private var tab = 0
+              private val h = Handler(Looper.getMainLooper())
+
+              private val REQ_CAPTURE = 1
+              private val REQ_NOTIF = 2
+              private var flow = false          // guided setup is running
+              private var pending: String? = null
+              private var askedNotif = false
+
+              private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+
+              private fun accOn() = ClickerAccessibility.instance != null
+              private fun ovlOn() = Settings.canDrawOverlays(this)
+              private fun notifOn() = Build.VERSION.SDK_INT < 33 ||
+                  checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED
+              private fun batOn() = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+              private fun isXiaomi() = listOf(Build.MANUFACTURER, Build.BRAND).any {
+                  val s = it.lowercase()
+                  s == "xiaomi" || s == "redmi" || s == "poco"
+              }
+              private fun xiaomiDone() = Store.prefs(this).getBoolean("xdone", false)
+
+              // ------------------------------------------------------------------ shell
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = Theme.BG
+                  window.navigationBarColor = Theme.CARD
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Theme.BG)
+                  }
+
+                  val header = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(16), dp(14), dp(16), dp(6))
+                  }
+                  header.addView(ImageView(this).apply { setImageResource(R.mipmap.ic_launcher) }, LinearLayout.LayoutParams(dp(38), dp(38)))
+                  header.addView(
+                      Ui.text(this, "Image Clicker", 22f, Theme.TEXT, true).apply { setPadding(dp(12), 0, 0, 0) }
+                  )
+                  root.addView(header)
+
+                  content = FrameLayout(this)
+                  root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  nav = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(Theme.CARD)
+                  }
+                  root.addView(nav, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  setContentView(root)
+                  show(0)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  // short delay: the accessibility service needs a moment to connect after being enabled
+                  h.postDelayed({
+                      if (!isFinishing) {
+                          show(tab)
+                          if (flow) resumeFlow()
+                      }
+                  }, 500)
+              }
+
+              private fun show(i: Int) {
+                  tab = i
+                  content.removeAllViews()
+                  content.addView(
+                      when (i) {
+                          0 -> homeView()
+                          1 -> targetsView()
+                          2 -> profilesView()
+                          else -> helpView()
+                      }
+                  )
+                  renderNav()
+              }
+
+              private fun renderNav() {
+                  nav.removeAllViews()
+                  val items = listOf(Ic.HOME to "Home", Ic.LIST to "Targets", Ic.SAVE to "Profiles", Ic.INFO to "Help")
+                  items.forEachIndexed { i, item ->
+                      val on = i == tab
+                      val col = if (on) Theme.GOLD else Theme.MUTED
+                      val v = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER_HORIZONTAL
+                          setPadding(0, dp(10), 0, dp(10))
+                          isClickable = true
+                          setOnClickListener { show(i) }
+                      }
+                      v.addView(IconView(this, item.first, col), LinearLayout.LayoutParams(dp(24), dp(24)))
+                      v.addView(Ui.text(this, item.second, 11f, col).apply { gravity = Gravity.CENTER })
+                      nav.addView(v, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+              }
+
+              private fun page(build: LinearLayout.() -> Unit): View {
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(8), dp(16), dp(16))
+                  }
+                  col.build()
+                  return ScrollView(this).apply {
+                      isVerticalScrollBarEnabled = false
+                      addView(col)
+                  }
+              }
+
+              // ------------------------------------------------------------------ dialogs
+
+              private fun dialog(title: String, view: View, ok: String, onOk: () -> Unit) {
+                  AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                      .setTitle(title)
+                      .setView(view)
+                      .setPositiveButton(ok) { _, _ -> onOk() }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun confirm(msg: String, onOk: () -> Unit) {
+                  AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                      .setMessage(msg)
+                      .setPositiveButton("Yes") { _, _ -> onOk() }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun askText(title: String, initial: String, onOk: (String) -> Unit) {
+                  val et = EditText(this).apply {
+                      setText(initial)
+                      setTextColor(Color.WHITE)
+                      setSingleLine()
+                      setPadding(dp(20), dp(14), dp(20), dp(14))
+                  }
+                  dialog(title, et, "OK") { onOk(et.text.toString()) }
+              }
+
+              private fun editClickPoint(t: Target) {
+                  val bmp = Targets.bitmap(this, t) ?: return
+                  val tv = ThumbView(this, bmp, t.fx, t.fy, true)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(8), dp(16), 0)
+                  }
+                  box.addView(Ui.text(this, "Tap the picture where the click should land.", 13f, Theme.MUTED))
+                  box.addView(tv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220)))
+                  dialog("Click point: ${t.name}", box, "Save") {
+                      val all = Targets.list(this)
+                      all.firstOrNull { it.id == t.id }?.let { it.fx = tv.fx; it.fy = tv.fy }
+                      Targets.saveAll(this, all)
+                      ClickerService.instance?.reload()
+                      show(1)
+                  }
+              }
+
+              // ------------------------------------------------------------------ Home
+
+              private fun homeView(): View = page {
+                  val ctx = this@MainActivity
+                  val running = ClickerService.instance != null
+                  val ready = accOn() && ovlOn()
+
+                  val hero = Ui.card(ctx)
+                  hero.addView(
+                      Ui.text(ctx, if (running) "Running" else if (ready) "Ready" else "Setup needed", 24f, Theme.TEXT, true)
+                  )
+                  hero.addView(
+                      Ui.text(
+                          ctx,
+                          "Targets: ${Targets.list(ctx).size}    Tap points: ${Store.points(ctx).size}    Speed: ${Store.cps(ctx)}/s",
+                          13f, Theme.MUTED
+                      ).apply { setPadding(0, dp(4), 0, 0) }
+                  )
+                  val pf = Profiles.active(ctx)
+                  if (pf.isNotEmpty()) hero.addView(Ui.text(ctx, "Profile: $pf", 13f, Theme.MUTED))
+                  addView(hero)
+
+                  val chk = Ui.card(ctx)
+                  chk.addView(Ui.text(ctx, "Permissions", 16f, Theme.TEXT, true))
+                  fun row(ok: Boolean, name: String, fix: (() -> Unit)?) {
+                      val r = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(0, dp(8), 0, dp(8))
+                      }
+                      r.addView(
+                          IconView(ctx, if (ok) Ic.CHECK else Ic.WARN, if (ok) Theme.OK else Theme.GOLD),
+                          LinearLayout.LayoutParams(dp(22), dp(22))
+                      )
+                      r.addView(
+                          Ui.text(ctx, name, 14f).apply { setPadding(dp(10), 0, 0, 0) },
+                          LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      )
+                      if (!ok && fix != null) r.addView(Ui.chip(ctx, "Fix", true) { fix() })
+                      chk.addView(r)
+                  }
+                  row(accOn(), "Accessibility service") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  row(ovlOn(), "Display over other apps") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  row(notifOn(), "Notifications") { requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), REQ_NOTIF) }
+                  row(batOn(), "Battery: no restrictions") { askBattery() }
+                  if (isXiaomi()) row(xiaomiDone(), "Xiaomi / POCO: autostart & pop-ups") { show(3) }
+                  addView(chk)
+
+                  addView(Ui.button(ctx, if (running) "Restart" else "Set up & Start", true, Ic.PLAY) {
+                      flow = true; pending = null; askedNotif = false
+                      if (running) stopService(Intent(ctx, ClickerService::class.java))
+                      advance()
+                  })
+                  if (running) {
+                      addView(Ui.button(ctx, "Stop", false, Ic.CLOSE) {
+                          stopService(Intent(ctx, ClickerService::class.java))
+                          h.postDelayed({ show(0) }, 400)
+                      })
+                  }
+
+                  val sp = Ui.card(ctx)
+                  sp.addView(Ui.text(ctx, "Speed", 16f, Theme.TEXT, true))
+                  Ui.slider(ctx, sp, "Taps per second", 5, 30, 1, Store.cps(ctx), "") { Store.setCps(ctx, it) }
+                  addView(sp)
+              }
+
+              // ------------------------------------------------------------------ Targets
+
+              private fun targetsView(): View = page {
+                  val ctx = this@MainActivity
+                  val list = Targets.list(ctx)
+
+                  addView(Ui.text(ctx, "Targets", 22f, Theme.TEXT, true))
+                  val info = Ui.card(ctx)
+                  info.addView(
+                      Ui.text(
+                          ctx,
+                          "Targets are pictures the app clicks whenever it sees them (Claim, ❌, Skip, Close). " +
+                              "Add them with the pencil button on the floating bar while your game is open. " +
+                              "The gold cross shows where the click lands. Tap a picture's pencil to move it.",
+                          13f, Theme.MUTED
+                      )
+                  )
+                  info.layoutParams = (info.layoutParams as LinearLayout.LayoutParams).apply { topMargin = dp(8) }
+                  addView(info)
+
+                  // ---- text buttons (OCR)
+                  val tc = Ui.card(ctx)
+                  tc.addView(Ui.text(ctx, "Text buttons", 16f, Theme.TEXT, true))
+                  tc.addView(
+                      Ui.text(
+                          ctx,
+                          "The app reads the screen text (offline) and clicks matching words, whatever the button looks like. " +
+                              "Great for Claim, Skip, Close, Continue. English text.",
+                          12f, Theme.MUTED
+                      ).apply { setPadding(0, dp(4), 0, dp(6)) }
+                  )
+                  Store.words(ctx).forEachIndexed { i, w ->
+                      val r = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(0, dp(6), 0, dp(6))
+                      }
+                      r.addView(Ui.text(ctx, w.first, 15f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      r.addView(ToggleView(ctx, w.second) { on ->
+                          val l = Store.words(ctx).toMutableList()
+                          if (i in l.indices) l[i] = Pair(l[i].first, on)
+                          Store.setWords(ctx, l)
+                      })
+                      r.addView(Ui.iconBtn(ctx, Ic.TRASH, Theme.BAD) {
+                          val l = Store.words(ctx).toMutableList()
+                          if (i in l.indices) l.removeAt(i)
+                          Store.setWords(ctx, l)
+                          show(1)
+                      })
+                      tc.addView(r)
+                  }
+                  tc.addView(Ui.gap(ctx, 6))
+                  tc.addView(Ui.button(ctx, "Add word", true, Ic.ADD) {
+                      askText("Word on the button", "") { w ->
+                          if (w.isNotBlank()) {
+                              Store.setWords(ctx, Store.words(ctx) + Pair(w.trim(), true))
+                              show(1)
+                          }
+                      }
+                  })
+                  tc.addView(Ui.button(ctx, "Reset to presets", false) { Store.resetWords(ctx); show(1) })
+                  addView(tc)
+
+                  addView(Ui.text(ctx, "Picture targets", 18f, Theme.TEXT, true).apply { setPadding(0, dp(4), 0, dp(8)) })
+                  if (list.isEmpty()) {
+                      addView(Ui.text(ctx, "No picture targets yet. Add one with the pencil on the floating bar.", 14f, Theme.MUTED))
+                  }
+                  for (t in list) {
+                      val bmp = Targets.bitmap(ctx, t) ?: continue
+                      val card = Ui.card(ctx)
+
+                      val top = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                      }
+                      val thumb = ThumbView(ctx, bmp, t.fx, t.fy, false).apply {
+                          background = rounded(Theme.CARD2, dpf(10f))
+                      }
+                      top.addView(thumb, LinearLayout.LayoutParams(dp(96), dp(64)))
+
+                      val mid = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(dp(12), 0, dp(8), 0)
+                      }
+                      mid.addView(Ui.text(ctx, t.name, 15f, Theme.TEXT, true).apply {
+                          setOnClickListener {
+                              askText("Rename target", t.name) { n ->
+                                  val all = Targets.list(ctx)
+                                  all.firstOrNull { it.id == t.id }?.name = n.trim().ifEmpty { t.name }
+                                  Targets.saveAll(ctx, all)
+                                  ClickerService.instance?.reload()
+                                  show(1)
+                              }
+                          }
+                      })
+                      mid.addView(Ui.text(ctx, "click at ${(t.fx * 100).toInt()}% , ${(t.fy * 100).toInt()}%", 12f, Theme.MUTED))
+                      top.addView(mid, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      top.addView(ToggleView(ctx, t.enabled) { on ->
+                          val all = Targets.list(ctx)
+                          all.firstOrNull { it.id == t.id }?.enabled = on
+                          Targets.saveAll(ctx, all)
+                          ClickerService.instance?.reload()
+                      })
+                      card.addView(top)
+
+                      val acts = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.END
+                          setPadding(0, dp(10), 0, 0)
+                      }
+                      acts.addView(Ui.iconBtn(ctx, Ic.PENCIL) { editClickPoint(t) })
+                      acts.addView(Ui.iconBtn(ctx, Ic.TRASH, Theme.BAD) {
+                          confirm("Delete ${t.name}?") {
+                              Targets.delete(ctx, t)
+                              ClickerService.instance?.reload()
+                              show(1)
+                          }
+                      })
+                      card.addView(acts)
+                      addView(card)
+                  }
+
+                  val pts = Store.points(ctx)
+                  val pc = Ui.card(ctx)
+                  pc.addView(Ui.text(ctx, "Tap points (${pts.size})", 16f, Theme.TEXT, true))
+                  pc.addView(
+                      Ui.text(
+                          ctx,
+                          "Where the endless farm taps land. Add and move them with the pencil button on the floating bar. " +
+                              "With no points, the screen center is tapped.",
+                          12f, Theme.MUTED
+                      ).apply { setPadding(0, dp(4), 0, dp(4)) }
+                  )
+                  pts.forEachIndexed { i, p ->
+                      val r = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(0, dp(4), 0, dp(4))
+                      }
+                      r.addView(
+                          Ui.text(ctx, "Point ${i + 1}   (${p.first.toInt()}, ${p.second.toInt()})", 14f),
+                          LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      )
+                      r.addView(Ui.iconBtn(ctx, Ic.TRASH, Theme.BAD) {
+                          Store.removePoint(ctx, i)
+                          ClickerService.instance?.reload()
+                          show(1)
+                      })
+                      pc.addView(r)
+                  }
+                  if (pts.isNotEmpty()) {
+                      pc.addView(Ui.gap(ctx, 6))
+                      pc.addView(Ui.button(ctx, "Clear all tap points", false, Ic.TRASH) {
+                          confirm("Remove all tap points?") {
+                              Store.setPoints(ctx, emptyList())
+                              ClickerService.instance?.reload()
+                              show(1)
+                          }
+                      })
+                  }
+                  addView(pc)
+              }
+
+              // ------------------------------------------------------------------ Profiles
+
+              private fun profilesView(): View = page {
+                  val ctx = this@MainActivity
+                  addView(Ui.text(ctx, "Profiles", 22f, Theme.TEXT, true))
+
+                  val info = Ui.card(ctx)
+                  info.addView(
+                      Ui.text(
+                          ctx,
+                          "Your setup (targets, click points, tap points, speed, sensitivity) is saved automatically. " +
+                              "Save it as a named profile to keep one setup per game and switch in one tap.",
+                          13f, Theme.MUTED
+                      )
+                  )
+                  info.layoutParams = (info.layoutParams as LinearLayout.LayoutParams).apply { topMargin = dp(8) }
+                  addView(info)
+
+                  addView(Ui.button(ctx, "Save current setup as profile", true, Ic.SAVE) {
+                      askText("Profile name", "") { n ->
+                          if (Profiles.save(ctx, n)) toast("Saved") else toast("Type a name first")
+                          show(2)
+                      }
+                  })
+                  val active = Profiles.active(ctx)
+                  if (active.isNotEmpty()) {
+                      addView(Ui.button(ctx, "Update \"$active\" with current setup", false, Ic.SAVE) {
+                          Profiles.save(ctx, active)
+                          toast("Updated")
+                          show(2)
+                      })
+                  }
+
+                  val names = Profiles.list(ctx)
+                  if (names.isEmpty()) addView(Ui.text(ctx, "No saved profiles yet.", 14f, Theme.MUTED))
+                  for (n in names) {
+                      val card = Ui.card(ctx)
+                      val r = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                      }
+                      r.addView(
+                          Ui.text(ctx, if (n == active) "$n  ✓" else n, 16f, if (n == active) Theme.GOLD else Theme.TEXT, true),
+                          LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      )
+                      r.addView(Ui.chip(ctx, "Load", true) {
+                          Profiles.load(ctx, n)
+                          ClickerService.instance?.reload()
+                          toast("Loaded $n")
+                          show(2)
+                      })
+                      r.addView(Ui.iconBtn(ctx, Ic.TRASH, Theme.BAD) {
+                          confirm("Delete profile $n?") { Profiles.delete(ctx, n); show(2) }
+                      })
+                      card.addView(r)
+                      addView(card)
+                  }
+              }
+
+              // ------------------------------------------------------------------ Help
+
+              private fun open(vararg intents: Intent) {
+                  for (i in intents) {
+                      try {
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          startActivity(i)
+                          return
+                      } catch (e: Exception) { }
+                  }
+                  try {
+                      startActivity(appInfo())
+                  } catch (e: Exception) { }
+              }
+
+              private fun appInfo() = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+
+              private fun askBattery() {
+                  open(
+                      Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")),
+                      Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                  )
+              }
+
+              private fun helpView(): View = page {
+                  val ctx = this@MainActivity
+                  addView(Ui.text(ctx, "Help & Settings", 22f, Theme.TEXT, true))
+
+                  val det = Ui.card(ctx)
+                  det.layoutParams = (det.layoutParams as LinearLayout.LayoutParams).apply { topMargin = dp(8) }
+                  det.addView(Ui.text(ctx, "Detection", 16f, Theme.TEXT, true))
+                  Ui.slider(ctx, det, "Match sensitivity (lower = more tolerant)", 60, 95, 1, Store.threshold(ctx), "%") {
+                      Store.setThreshold(ctx, it)
+                  }
+                  Ui.slider(ctx, det, "Look for targets every", 200, 2000, 100, Store.scanMs(ctx).toInt(), " ms") {
+                      Store.setScanMs(ctx, it)
+                  }
+                  Ui.slider(ctx, det, "Read screen text every", 500, 5000, 250, Store.textMs(ctx).toInt(), " ms") {
+                      Store.setTextMs(ctx, it)
+                  }
+                  val fr = LinearLayout(ctx).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, dp(14), 0, 0)
+                  }
+                  fr.addView(
+                      Ui.text(ctx, "Flexible matching: same shape in other sizes or colours", 14f),
+                      LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  )
+                  fr.addView(ToggleView(ctx, Store.flex(ctx)) { on ->
+                      Store.setFlex(ctx, on)
+                      ClickerService.instance?.reload()
+                  })
+                  det.addView(fr)
+                  addView(det)
+
+                  val mi = Ui.card(ctx)
+                  mi.addView(Ui.text(ctx, if (isXiaomi()) "Xiaomi / POCO / Redmi (your phone)" else "Xiaomi / POCO / Redmi", 16f, Theme.GOLD, true))
+                  mi.addView(
+                      Ui.text(
+                          ctx,
+                          "MIUI and HyperOS stop background apps and switch off accessibility services. Do these once:\n\n" +
+                              "1. Autostart: ON\n" +
+                              "2. Battery saver for this app: No restrictions\n" +
+                              "3. Other permissions: allow 'Display pop-up windows while running in the background'\n" +
+                              "4. Recents: open the recent-apps screen, pull this app's card down (or tap the lock) so it stays locked\n" +
+                              "5. If the Accessibility switch is greyed out: App info > ⋮ (top right) > Allow restricted settings",
+                          13f, Theme.MUTED
+                      ).apply { setPadding(0, dp(6), 0, dp(10)) }
+                  )
+                  mi.addView(Ui.button(ctx, "1. Autostart", false) {
+                      open(Intent().setComponent(ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity")))
+                  })
+                  mi.addView(Ui.button(ctx, "2. Battery: no restrictions", false) {
+                      open(
+                          Intent().setComponent(ComponentName("com.miui.powerkeeper", "com.miui.powerkeeper.ui.HiddenAppsConfigActivity"))
+                              .putExtra("package_name", packageName).putExtra("package_label", "Image Clicker"),
+                          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")),
+                          Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                      )
+                  })
+                  mi.addView(Ui.button(ctx, "3. Pop-up permission", false) {
+                      open(
+                          Intent("miui.intent.action.APP_PERM_EDITOR")
+                              .setClassName("com.miui.securitycenter", "com.miui.permcenter.permissions.PermissionsEditorActivity")
+                              .putExtra("extra_pkgname", packageName),
+                          Intent("miui.intent.action.APP_PERM_EDITOR")
+                              .setClassName("com.miui.securitycenter", "com.miui.permcenter.permissions.AppPermissionsEditorActivity")
+                              .putExtra("extra_pkgname", packageName)
+                      )
+                  })
+                  mi.addView(Ui.button(ctx, "5. App info (restricted settings)", false) { open(appInfo()) })
+                  mi.addView(Ui.button(ctx, if (xiaomiDone()) "Marked as done ✓" else "I did these steps", true, Ic.CHECK) {
+                      Store.prefs(ctx).edit().putBoolean("xdone", true).apply()
+                      show(3)
+                  })
+                  addView(mi)
+
+                  val gen = Ui.card(ctx)
+                  gen.addView(Ui.text(ctx, "Other phones", 16f, Theme.TEXT, true))
+                  gen.addView(
+                      Ui.text(
+                          ctx,
+                          "Set battery to 'No restrictions' for this app and keep the notification visible. " +
+                              "If the clicker stops after a while, the system switched off the accessibility service. " +
+                              "Turn it ON again in Accessibility settings.",
+                          13f, Theme.MUTED
+                      ).apply { setPadding(0, dp(6), 0, dp(10)) }
+                  )
+                  gen.addView(Ui.button(ctx, "Battery: no restrictions", false) { askBattery() })
+                  gen.addView(Ui.button(ctx, "Accessibility settings", false) {
+                      open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  addView(gen)
+
+                  val how = Ui.card(ctx)
+                  how.addView(Ui.text(ctx, "How it works", 16f, Theme.TEXT, true))
+                  how.addView(
+                      Ui.text(
+                          ctx,
+                          "Floating bar:  ▶ start/pause   ✎ editor   👁 show tap points   ⚙ quick settings   ✕ exit.\n\n" +
+                              "In the editor: tap empty space to add a tap point, drag a numbered point to move it " +
+                              "(drop on the trash to delete), drag a gold dot to change where a target is clicked, " +
+                              "or switch to 'New target' and drag a box around a button.\n\n" +
+                              "Scanning runs in parallel with the taps. It looks for your picture targets (also other sizes " +
+                              "and colours of the same shape) and for your text words. The first thing it finds is clicked; " +
+                              "otherwise the tap points are tapped in turn. Landscape and portrait need separate setups: use profiles.",
+                          13f, Theme.MUTED
+                      ).apply { setPadding(0, dp(6), 0, 0) }
+                  )
+                  addView(how)
+              }
+
+              // ------------------------------------------------------------------ guided setup
+
+              private fun resumeFlow() {
+                  val p = pending
+                  if (p != null) {
+                      pending = null
+                      val ok = if (p == "acc") accOn() else ovlOn()
+                      if (!ok) {
+                          flow = false
+                          toast("Still OFF. Press 'Set up & Start' again when ready.")
+                          return
+                      }
+                  }
+                  advance()
+              }
+
+              /** Opens the next missing permission, or starts screen capture when everything is ready. */
+              private fun advance() {
+                  when {
+                      !accOn() -> {
+                          pending = "acc"
+                          toast("Turn ON 'Image Clicker', then press Back")
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                      !ovlOn() -> {
+                          pending = "ovl"
+                          toast("Allow 'Image Clicker', then press Back")
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      }
+                      !notifOn() && !askedNotif -> {
+                          askedNotif = true
+                          requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), REQ_NOTIF)
+                      }
+                      else -> {
+                          flow = false
+                          val mpm = getSystemService(MediaProjectionManager::class.java)
+                          @Suppress("DEPRECATION")
+                          startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE)
+                      }
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_CAPTURE && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, ClickerService::class.java)
+                          .putExtra("code", resultCode)
+                          .putExtra("data", data)
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          IC_EOF
           base64 -d > ic-android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png <<'IC_EOF'
-          iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAADAFBMVEWcp9HfoFglHmVrVWEhHWLZ0NKOYeHTn5atXSRup9UaEGEZ
-          EGCHUmGZaZJyKRweDTeyillti7Q3TaNfaKWgnatWMVa1yeAHBjJJJpxaXKLZlDnbw6rEcFJtbXXMXyfVpPM1SKujORg6R3p5CXlS
-          KZsxGYw0SbI9c9FQMKdQLqdcYJpmV5xlRuEIbm6APdE/P781R6VhLsBwSzh72vD5wz4+NMFxY+Lcwnr///+jnKoKACg/WcxEM2t/
-          AP9MQHKEdqWyzH//AP8tGYgwFXhuOcpOV88wJJEAAABpRs1SKKw5V9H5/PhIJo9WNq73uEk0N69MZdlSScpIKHn6x05uV7X85m4t
-          KqVORbFwV9BFZuE2SsY7ZNr1lzVxR3KINzBkN7b71VVoR7X4pzlrhe1oeef8+c789q5PNZE3RbnyqEqL9ftWNHeJWG+yiPiKaKoa
-          EmtvR5DziTX985GOZ+ZpmPrMlvwZDWVlOnMpDXH612tBHZKOZpHSmG1wZdmVRTL76YwVClRaeOPmqG7zx2yrSi90VpKUdKjPh1CJ
-          WY7tt3I2I3d4Kiu0lfvQdjNTVbiuVzVRPMZ2Y7E3NJmIZNr5tDzyx4yTZG6FWdc9aeHUllBvZ+bQaC/2145VRZBzt/iuZ07leTVR
-          ddeqd/JYS+bV6vd4w/kpFlXGVi13VHRlOpKLduWMiPOrdm2qV0W0dVL88nhspfiyh43tuIf46K0ZE1bqmEiXdJLIe0/Ei/q2ZTR8
-          Mi+oeY3WpHKEXKiIWurImIvu2K315s7VhTbTp5CR6Pc4Vbija3GLuPtyZJVqddzKimodGIpaVeq2hnEBAXyRpftXhuZak+jpxq4x
-          JVVUVpCtqP4kC1NNR3aCRdKYV0qNh628k4j741wcI5azt8/X9Pzn6fGaVDaMlPiriKoGAVMAAP9AHn1hLrevRxm3lXSq+Py0lqrV
-          uKfO1+pNNlNzdZiCLS2Xc3WpS0Kr5/JUhc2PNxeSlbKEw/eM2fJOZrFtWerOp6xsmc7WtJNNd7dZls/TvT0PAAABAHRSTlP//+P/
-          F///////aKL////////v7P/7/w7qCf///wj//6b//wIa+GX/ZaRmov8D/wQn//////8E/wEZZRRaAkM2CgH+/v7//gD+/v7//v7/
-          /v7+///+///////+//////7//v////////7//////v/+//////7//f/+//////////7//////////////////v/+//7//////v//
-          /////v7///7+//////////////////7////+///////////////////////////////+/wT////////////+//////////////8H
-          Af///////////////////v//////////////q2rfswAAOeRJREFUeNqtnQlAU2e69wO470tr12mns96ZuXfuN3P3b/9ySEggJwkg
-          JCIQw2JCQVGxyBJC2IwBAQWBYROxFlGRyiZFmMGCOi7VseqtS1uXtk5trbUd7eJtO/2e533fc3ISEqB2HhUCiP5/77O+7zkkshDf
-          dvOxf4e3P/jf//NXv1ps5k1SC+bxY57fQoy8D5+kKcaxUEWol1VULPrhD3/5SyJnyk0/QmU+P/uDJ+DNY7N+tdhCtAcH/+Y3IHs8
-          28LeiTBbwv1yxYCFjmOSLwIYUPwS5TwxeQCU/9h/Dyzlg3Gl1bwpWFVXlyFYNZj4gFjGXr+WlJSUOLGtR0t8ff3610U7e7+1dfly
-          RqGvWPzLxwDhzOQAQP5//KpZwwcHb1GbTKq6aTtXvfLKCz5ss4f953gmI/ZHH/aF+EC0l754idj27Qdev69Hj8SEVlTNBoR/mATA
-          D+D3r5aag4OD1SCean8FbZVf2+zb/vM//zSuMeHb/7jdp73EKA6cXX7UCjF3lCCcmQjgxyH/95fNJh4XH9QT7at27sz4Q92lS5dU
-          Ps3o1/JE00/CWkUrQDt79vUDB7YzhvuhVkiMo4tmhYRMGR/gJyH/B4rOFl4dXE3Ur9qZUacK9jbV+DZBufEyN8KyZfBbsOVorUBB
-          fLH97HIrZMPRn04JmfLv/gGgVP3SDLVEbUL5L7yys+6SKHmy6gW3TKz8tddeWzaB6QHi5/cPUASSz1WziEzfAD8OCZlt4beo+TqU
-          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
-          ph+h/x+XId4qmk0gqAAAAABJRU5ErkJggg==
+          iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAABgFBMVEXenmBkWqKjZlwkF1/12ZZeaeKOZOGSaZmgnvLTbTGtUy9n
+          oenXqpLe5Oj21m6ojp54LCouK5XspDqb3/RqUm9RO8U9auBgNJwPDGe1i2t4xfjHeVA3UrFLK2THj/mNMyAaEGEZEGAeDTcAAP9t
+          i7QHBjJaXKJtbXU1SKs6R3p5CXlSKZs0SbJQMKdQLqdcYJpmV5wIbm6APdE/P781R6VwSzj5wz4+NMFxY+L///+jnKoKACg/WcxE
+          M2t/AP9MQHKEdqWyzH//AP8tGYgwFXhuOcpOV88wJJEAAABpRs1SKKw5V9H5/PhIJo9WNq73uEk0N69MZdlSScpIKHn6x05uV7X8
+          5m4tKqVORbFwV9BFZuE2SsY7ZNr1lzVxR3KINzBkN7b71VVoR7X4pzlrhe1oeef8+c789q5PNZE3RbnyqEqL9ftWNHeJWG+yiPiK
+          aKoaEmtvR5DziTX985GOZ+ZpmPrMlvwZDWVlOnMpDXH612tBHZKOZpHSmG1wZdmVRTJglOhmAAAAgHRSTlP//v/8//7+//////7/
+          //////7////+//sM////+f7//2ii/wH/DgkIpv8CGmVlpGaiA/8EJ////wQBGWUUWgJDNgoB/v7+//4A/v7+//7+//7+/v///v//
+          /////v/////+//7////////+//////7//v/////+//3//v///////9jcfGEAADD/SURBVHjarZ2JQxrZtu6rKGYZBEmr0czpPn3m
+          c899505vfpSUoBSgRCFGJDgEbE1MNHHGf/19a+29a2DSTp+VRFET8/32GveuErTl0fbqx//E29/97//5t7/pHbvttSWbPrbtR2z8
+          fu2BVphgK4WVAdP1xZ9//utfWc7cqzFCtZGf/d1PePPj87/pXda+tPToEWRPskfynQPzaG0s1xZsZYJ5vggwUPyV5Pz0cACS/+N/
+          Nwx7iVa6ZLeXiuHwmbJwWH4QVuY+GrL9/f29++0r2d7U169THguF3r2TFDVd/+uPQJh7GADk/9ff9LKNdS+129Ae/vj06bcRFv1n
+          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
+          AAAASUVORK5CYII=
           IC_EOF
 
       - name: Build APK
