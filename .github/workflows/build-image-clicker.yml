@@ -26,7 +26,7 @@ jobs:
         run: |
           set -e
           mkdir -p ic-android/app/src/main/res/mipmap-xxxhdpi
-          mkdir -p $(dirname ic-android/settings.gradle.kts)
+          mkdir -p ic-android
           cat > ic-android/settings.gradle.kts <<'IC_EOF'
           pluginManagement {
               repositories { google(); mavenCentral(); gradlePluginPortal() }
@@ -37,17 +37,20 @@ jobs:
           rootProject.name = "ImageClicker"
           include(":app")
           IC_EOF
+          mkdir -p ic-android
           cat > ic-android/build.gradle.kts <<'IC_EOF'
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           IC_EOF
+          mkdir -p ic-android
           cat > ic-android/gradle.properties <<'IC_EOF'
           org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           IC_EOF
+          mkdir -p ic-android/app
           cat > ic-android/app/build.gradle.kts <<'IC_EOF'
           plugins {
               id("com.android.application")
@@ -82,6 +85,7 @@ jobs:
               implementation("com.google.mlkit:text-recognition:16.0.0")
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main
           cat > ic-android/app/src/main/AndroidManifest.xml <<'IC_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -128,6 +132,7 @@ jobs:
               </application>
           </manifest>
           IC_EOF
+          mkdir -p ic-android/app/src/main/res/xml
           cat > ic-android/app/src/main/res/xml/accessibility_config.xml <<'IC_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
@@ -139,11 +144,13 @@ jobs:
               android:description="@string/accessibility_desc"
               android:notificationTimeout="100" />
           IC_EOF
+          mkdir -p ic-android/app/src/main/res/values
           cat > ic-android/app/src/main/res/values/strings.xml <<'IC_EOF'
           <resources>
               <string name="accessibility_desc">Used only to perform taps on the screen for the auto clicker.</string>
           </resources>
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerAccessibility.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -208,6 +215,7 @@ jobs:
               }
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerService.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -1038,6 +1046,7 @@ jobs:
               }
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/EditorView.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -1277,6 +1286,7 @@ jobs:
               }
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Icons.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -1438,6 +1448,7 @@ jobs:
               }
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/MainActivity.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -2109,6 +2120,7 @@ jobs:
               }
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Manager.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -2566,6 +2578,7 @@ jobs:
               }
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Profiles.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -2625,6 +2638,7 @@ jobs:
               }
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Store.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -2684,6 +2698,7 @@ jobs:
               fun resetWords(c: Context) = prefs(c).edit().remove("words").apply()
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Targets.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -2802,6 +2817,7 @@ jobs:
               fun bitmap(c: Context, t: Target): Bitmap? = BitmapFactory.decodeFile(image(c, t).path)
           }
           IC_EOF
+          mkdir -p ic-android/app/src/main/java/com/autoclicker/imageclicker
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Ui.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -3023,7 +3039,6 @@ jobs:
                   return true
               }
           }
-          IC_EOF
           IC_EOF
           base64 -d > ic-android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png <<'IC_EOF'
           iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAABgFBMVEXenmBkWqKjZlwkF1/12ZZeaeKOZOGSaZmgnvLTbTGtUy9n
