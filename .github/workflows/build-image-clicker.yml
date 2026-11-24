@@ -37,20 +37,17 @@ jobs:
           rootProject.name = "ImageClicker"
           include(":app")
           IC_EOF
-          mkdir -p $(dirname ic-android/build.gradle.kts)
           cat > ic-android/build.gradle.kts <<'IC_EOF'
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           IC_EOF
-          mkdir -p $(dirname ic-android/gradle.properties)
           cat > ic-android/gradle.properties <<'IC_EOF'
           org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           IC_EOF
-          mkdir -p $(dirname ic-android/app/build.gradle.kts)
           cat > ic-android/app/build.gradle.kts <<'IC_EOF'
           plugins {
               id("com.android.application")
@@ -65,8 +62,8 @@ jobs:
                   applicationId = "com.autoclicker.imageclicker"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
                   ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
               }
 
@@ -85,7 +82,6 @@ jobs:
               implementation("com.google.mlkit:text-recognition:16.0.0")
           }
           IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/AndroidManifest.xml)
           cat > ic-android/app/src/main/AndroidManifest.xml <<'IC_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -100,6 +96,7 @@ jobs:
                   android:allowBackup="false"
                   android:icon="@mipmap/ic_launcher"
                   android:label="Image Clicker"
+                  android:supportsRtl="true"
                   android:theme="@android:style/Theme.DeviceDefault">
 
                   <activity
@@ -118,7 +115,7 @@ jobs:
 
                   <service
                       android:name=".ClickerAccessibility"
-                      android:exported="false"
+                      android:exported="true"
                       android:label="Image Clicker"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
                       <intent-filter>
@@ -131,7 +128,6 @@ jobs:
               </application>
           </manifest>
           IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/res/xml/accessibility_config.xml)
           cat > ic-android/app/src/main/res/xml/accessibility_config.xml <<'IC_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
@@ -143,209 +139,1144 @@ jobs:
               android:description="@string/accessibility_desc"
               android:notificationTimeout="100" />
           IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/res/values/strings.xml)
           cat > ic-android/app/src/main/res/values/strings.xml <<'IC_EOF'
           <resources>
               <string name="accessibility_desc">Used only to perform taps on the screen for the auto clicker.</string>
           </resources>
           IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Store.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Store.kt <<'IC_EOF'
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerAccessibility.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
-          import android.content.Context
-          import android.content.SharedPreferences
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicBoolean
 
-          object Store {
-              fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+          /** Only job: perform a tap at (x, y). */
+          class ClickerAccessibility : AccessibilityService() {
 
-              fun cps(c: Context): Int = prefs(c).getInt("cps", 15)
-              fun setCps(c: Context, v: Int) = prefs(c).edit().putInt("cps", v).apply()
-              fun threshold(c: Context): Int = prefs(c).getInt("thr", 80)
-              fun setThreshold(c: Context, v: Int) = prefs(c).edit().putInt("thr", v).apply()
-              fun scanMs(c: Context): Long = prefs(c).getInt("scan", 500).toLong()
-              fun setScanMs(c: Context, v: Int) = prefs(c).edit().putInt("scan", v).apply()
-              fun markers(c: Context): Boolean = prefs(c).getBoolean("markers", false)
-              fun setMarkers(c: Context, v: Boolean) = prefs(c).edit().putBoolean("markers", v).apply()
+              companion object {
+                  @Volatile var instance: ClickerAccessibility? = null
+              }
 
-              /** Unlimited farm tap points, stored as "x,y;x,y;..." */
-              fun points(c: Context): List<Pair<Float, Float>> {
-                  val raw = prefs(c).getString("pts", "") ?: ""
-                  return raw.split(";").mapNotNull {
-                      val s = it.split(",")
-                      val x = s.getOrNull(0)?.toFloatOrNull()
-                      val y = s.getOrNull(1)?.toFloatOrNull()
-                      if (x != null && y != null) Pair(x, y) else null
+              override fun onServiceConnected() { instance = this }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              @Volatile private var fails = 0
+              @Volatile private var useLine = false
+
+              /** Blocking tap (call from a background thread). Returns true when the system really performed it. */
+              fun tap(x: Float, y: Float): Boolean {
+                  val path = Path().apply {
+                      moveTo(x, y)
+                      if (useLine) lineTo(x + 1f, y)   // some MIUI / HyperOS builds ignore zero-length taps
                   }
-              }
-              fun setPoints(c: Context, list: List<Pair<Float, Float>>) =
-                  prefs(c).edit().putString("pts", list.joinToString(";") { "${it.first},${it.second}" }).apply()
-              fun removePoint(c: Context, i: Int) {
-                  val l = points(c).toMutableList()
-                  if (i in l.indices) { l.removeAt(i); setPoints(c, l) }
-              }
-
-              fun flex(c: Context): Boolean = prefs(c).getBoolean("flex", true)
-              fun setFlex(c: Context, v: Boolean) = prefs(c).edit().putBoolean("flex", v).apply()
-              fun textMs(c: Context): Long = prefs(c).getInt("textms", 1500).toLong()
-              fun setTextMs(c: Context, v: Int) = prefs(c).edit().putInt("textms", v).apply()
-
-              private val DEFAULT_WORDS = listOf("Claim", "Collect", "Skip", "Skip Ad", "Close", "Continue")
-
-              /** Words the app reads on screen (OCR) and clicks. Stored as "word|1;word|0" */
-              fun words(c: Context): List<Pair<String, Boolean>> {
-                  val raw = prefs(c).getString("words", null) ?: return DEFAULT_WORDS.map { Pair(it, true) }
-                  return raw.split(";").filter { it.isNotBlank() }.map {
-                      val i = it.lastIndexOf('|')
-                      if (i < 0) Pair(it, true) else Pair(it.substring(0, i), it.substring(i + 1) == "1")
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
+                      .build()
+                  val latch = CountDownLatch(1)
+                  val done = AtomicBoolean(false)
+                  val ok = dispatchGesture(gesture, object : GestureResultCallback() {
+                      override fun onCompleted(g: GestureDescription?) { done.set(true); latch.countDown() }
+                      override fun onCancelled(g: GestureDescription?) { latch.countDown() }
+                  }, null)
+                  if (!ok) return false
+                  latch.await(500, TimeUnit.MILLISECONDS)
+                  if (done.get()) {
+                      fails = 0
+                  } else {
+                      fails++
+                      if (fails >= 4) { useLine = !useLine; fails = 0 }
                   }
+                  return done.get()
               }
-              fun wordsRaw(c: Context): String = prefs(c).getString("words", "") ?: ""
-              fun setWordsRaw(c: Context, raw: String) = prefs(c).edit().putString("words", raw).apply()
-              fun setWords(c: Context, list: List<Pair<String, Boolean>>) =
-                  setWordsRaw(c, list.joinToString(";") {
-                      it.first.replace(";", " ").replace("|", " ").trim() + "|" + (if (it.second) "1" else "0")
-                  })
-              fun resetWords(c: Context) = prefs(c).edit().remove("words").apply()
           }
           IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Targets.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Targets.kt <<'IC_EOF'
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerService.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.res.Configuration
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.graphics.PointF
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import org.opencv.android.OpenCVLoader
+          import org.opencv.android.Utils
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.TextRecognizer
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import org.opencv.core.Core
+          import org.opencv.core.CvType
+          import org.opencv.core.Mat
+          import org.opencv.core.Size
+          import org.opencv.imgproc.Imgproc
+          import java.util.concurrent.TimeUnit
+
+          class ClickerService : Service() {
+
+              companion object {
+                  const val ACTION_STOP = "com.autoclicker.imageclicker.STOP"
+                  private const val CHANNEL = "clicker"
+                  private const val SCALE = 0.5 // match on half-size images (faster)
+                  @Volatile var instance: ClickerService? = null
+              }
+
+              /** Something to tap: key = cooldown id, x/y = screen pixels, cool = wait afterwards (ms). */
+              private class Hit(val key: String, val x: Float, val y: Float, val cool: Long)
+
+              private class TextLine(val text: String, val cx: Float, val cy: Float)
+
+              /** One scaled copy of a target picture: grayscale + gradient (shape) map. */
+              private class Var(val gray: Mat, val grad: Mat)
+
+              private class Tpl(val t: Target, val vars: List<Var>) {
+                  fun release() { vars.forEach { it.gray.release(); it.grad.release() } }
+              }
+
+              /** Current screenshot prepared for matching (gradient map is built only when needed). */
+              private class Frm(val gray: Mat) {
+                  var grad: Mat? = null
+                  fun release() { gray.release(); grad?.release() }
+              }
+
+              private lateinit var wm: WindowManager
+              private val ui = Handler(Looper.getMainLooper())
+
+              private var projection: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var display: VirtualDisplay? = null
+              private var sw = 0
+              private var sh = 0
+              private var lastFrame: Bitmap? = null
+
+              private var panel: View? = null
+              private var markers: View? = null
+              private var editor: View? = null
+              private var manager: View? = null
+              private var playIcon: IconView? = null
+              private var playWrap: View? = null
+              private var eyeIcon: IconView? = null
+
+              @Volatile private var running = false
+              @Volatile private var gen = 0
+              @Volatile private var pendingHits: List<Hit>? = null
+              @Volatile private var holdUntil = 0L
+              @Volatile private var tapFails = 0
+              private val tplLock = Any()
+              private val ocrLock = Any()
+              private val cooldowns = HashMap<String, Long>()
+              private var ocrCache: List<TextLine>? = null
+              private var ocrAt = 0L
+              @Volatile private var templates: List<Tpl> = emptyList()
+              private var recognizer: TextRecognizer? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              }
+
+              private fun toast(t: String) { ui.post { Toast.makeText(this, t, Toast.LENGTH_SHORT).show() } }
+
+              /** Called by the app after profiles / targets changed. */
+              fun reload() {
+                  reloadAsync()
+                  ui.post { markers?.invalidate() }
+              }
+
+              private fun reloadAsync() {
+                  Thread { try { loadTemplates() } catch (_: Throwable) { } }.start()
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  ui.postDelayed({ rebuildCapture() }, 400)
+              }
+
+              /** Screen rotated: resize the capture so screenshots and taps stay aligned. */
+              @Suppress("DEPRECATION")
+              private fun rebuildCapture() {
+                  val d = display ?: return
+                  val dm = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  if (dm.widthPixels == sw && dm.heightPixels == sh) return
+                  sw = dm.widthPixels
+                  sh = dm.heightPixels
+                  val rd = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
+                  val old = reader
+                  synchronized(this) { reader = rd; lastFrame = null }
+                  d.resize(sw, sh, dm.densityDpi)
+                  d.surface = rd.surface
+                  old?.close()
+                  markers?.invalidate()
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent == null || intent.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
+                  if (projection != null) return START_NOT_STICKY
+
+                  startForegroundCompat()
+
+                  if (!OpenCVLoader.initLocal()) { toast("OpenCV failed to load"); stopSelf(); return START_NOT_STICKY }
+
+                  val code = intent.getIntExtra("code", 0)
+                  val data = intent.getParcelableExtra<Intent>("data")
+                  if (data == null) { stopSelf(); return START_NOT_STICKY }
+
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  val mp = mpm.getMediaProjection(code, data)
+                  projection = mp
+                  mp.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() { ui.post { stopSelf() } }
+                  }, ui)
+
+                  val dm = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  sw = dm.widthPixels
+                  sh = dm.heightPixels
+                  val rd = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
+                  reader = rd
+                  display = mp.createVirtualDisplay(
+                      "clicker", sw, sh, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null
+                  )
+
+                  loadTemplates()
+                  applyMarkers()
+                  showPanel()
+                  toast("Ready. Open your game and use the floating bar.")
+                  return START_NOT_STICKY
+              }
+
+              private fun startForegroundCompat() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CHANNEL, "Image Clicker", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(
+                      this, 0, Intent(this, ClickerService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val open = PendingIntent.getActivity(
+                      this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  @Suppress("DEPRECATION")
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setContentTitle("Image Clicker is running")
+                      .setContentText("Tap to open the app. Use Stop to quit.")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setContentIntent(open)
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stop)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else startForeground(1, n)
+              }
+
+              // ---------------------------------------------------------------- screen capture
+
+              @Synchronized
+              private fun grab(): Bitmap? {
+                  val img = reader?.acquireLatestImage()
+                  if (img != null) {
+                      try {
+                          val p = img.planes[0]
+                          val rowPad = p.rowStride - p.pixelStride * img.width
+                          val full = Bitmap.createBitmap(img.width + rowPad / p.pixelStride, img.height, Bitmap.Config.ARGB_8888)
+                          full.copyPixelsFromBuffer(p.buffer)
+                          if (rowPad == 0) {
+                              lastFrame = full
+                          } else {
+                              lastFrame = Bitmap.createBitmap(full, 0, 0, img.width, img.height)
+                              full.recycle()
+                          }
+                      } finally { img.close() }
+                  }
+                  return lastFrame
+              }
+
+              // ---------------------------------------------------------------- matching
+
+              private fun toGray(b: Bitmap): Mat {
+                  val m = Mat()
+                  Utils.bitmapToMat(b, m)
+                  Imgproc.cvtColor(m, m, Imgproc.COLOR_RGBA2GRAY)
+                  Imgproc.resize(m, m, Size(), SCALE, SCALE, Imgproc.INTER_AREA)
+                  return m
+              }
+
+              /** Edge strength map: matches the SHAPE even when colours or brightness differ. */
+              private fun gradient(gray: Mat): Mat {
+                  val g = Mat()
+                  gray.convertTo(g, CvType.CV_32F)
+                  val gx = Mat()
+                  val gy = Mat()
+                  Imgproc.Sobel(g, gx, CvType.CV_32F, 1, 0, 3)
+                  Imgproc.Sobel(g, gy, CvType.CV_32F, 0, 1, 3)
+                  val mag = Mat()
+                  Core.magnitude(gx, gy, mag)
+                  g.release(); gx.release(); gy.release()
+                  return mag
+              }
+
+              private fun makeTpl(t: Target, bmp: Bitmap): Tpl {
+                  val g = toGray(bmp)
+                  val vars = ArrayList<Var>()
+                  vars.add(Var(g, gradient(g)))
+                  if (Store.flex(this)) {
+                      // same picture a bit smaller / bigger
+                      for (s in listOf(0.8, 1.25, 0.65, 1.5)) {
+                          val o = Mat()
+                          Imgproc.resize(g, o, Size(), s, s, if (s < 1.0) Imgproc.INTER_AREA else Imgproc.INTER_LINEAR)
+                          if (o.cols() < 8 || o.rows() < 8) { o.release(); continue }
+                          vars.add(Var(o, gradient(o)))
+                      }
+                  }
+                  return Tpl(t, vars)
+              }
+
+              private fun loadTemplates() {
+                  val fresh = Targets.list(this).filter { it.enabled }.mapNotNull { t ->
+                      Targets.bitmap(this, t)?.let { makeTpl(t, it) }
+                  }
+                  synchronized(tplLock) {
+                      val old = templates
+                      templates = fresh
+                      old.forEach { it.release() }
+                  }
+              }
+
+              private fun thrFor(t: Target): Double = (if (t.thr > 0) t.thr else Store.threshold(this)) / 100.0
+
+              private fun matchMat(src: Mat, tpl: Mat, t: Target): Found? {
+                  if (tpl.cols() > src.cols() || tpl.rows() > src.rows()) return null
+                  val r = Mat()
+                  Imgproc.matchTemplate(src, tpl, r, Imgproc.TM_CCOEFF_NORMED)
+                  val mm = Core.minMaxLoc(r)
+                  r.release()
+                  if (mm.maxVal.isNaN()) return null
+                  val x = mm.maxLoc.x
+                  val y = mm.maxLoc.y
+                  return Found(
+                      t,
+                      (x / SCALE).toFloat(), (y / SCALE).toFloat(),
+                      ((x + tpl.cols()) / SCALE).toFloat(), ((y + tpl.rows()) / SCALE).toFloat(),
+                      mm.maxVal
+                  )
+              }
+
+              /**
+               * 1) exact look (grayscale, original size)
+               * 2) if flex: same shape in other sizes / colours (edge map at several scales)
+               */
+              private fun matchTpl(frame: Frm, tpl: Tpl, thr: Double, flex: Boolean): Found? {
+                  var best = matchMat(frame.gray, tpl.vars[0].gray, tpl.t)
+                  if (best != null && best.score >= thr) return best
+                  if (flex) {
+                      val fg = frame.grad ?: gradient(frame.gray).also { frame.grad = it }
+                      for (v in tpl.vars) {
+                          val f = matchMat(fg, v.grad, tpl.t) ?: continue
+                          if (f.score >= thr) return f
+                          if (best == null || f.score > best.score) best = f
+                      }
+                  }
+                  return best
+              }
+
+              // ---- cooldowns: every target / word waits on its own, so one button that stays on
+              // screen can never block the others.
+
+              private fun ready(key: String): Boolean =
+                  synchronized(cooldowns) { SystemClock.uptimeMillis() >= (cooldowns[key] ?: 0L) }
+
+              private fun markDone(key: String, ms: Long) {
+                  synchronized(cooldowns) { cooldowns[key] = SystemClock.uptimeMillis() + ms }
+              }
+
+              // ---- screen text (offline OCR), shared by word clicking and text conditions
+
+              private fun ocr(maxAge: Long): List<TextLine>? = synchronized(ocrLock) {
+                  val now = SystemClock.uptimeMillis()
+                  val cached = ocrCache
+                  if (cached != null && now - ocrAt <= maxAge) return@synchronized cached
+                  val bmp = grab() ?: return@synchronized null
+                  val rec = recognizer ?: TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).also { recognizer = it }
+                  val res = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)), 4, TimeUnit.SECONDS)
+                  val out = ArrayList<TextLine>()
+                  for (block in res.textBlocks) {
+                      for (line in block.lines) {
+                          val box = line.boundingBox ?: continue
+                          out.add(TextLine(line.text.trim(), box.exactCenterX(), box.exactCenterY()))
+                      }
+                  }
+                  ocrCache = out
+                  ocrAt = SystemClock.uptimeMillis()
+                  out
+              }
+
+              private fun textVisible(t: Target, lines: List<TextLine>): Boolean {
+                  val words = t.condText.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+                  if (words.isEmpty()) return false
+                  for (l in lines) {
+                      if (t.regOn && sw > 0 && sh > 0) {
+                          val fx = l.cx / sw
+                          val fy = l.cy / sh
+                          if (fx < t.rl || fx > t.rr || fy < t.rt || fy > t.rb) continue
+                      }
+                      val s = l.text.lowercase()
+                      for (w in words) if (s.contains(w)) return true
+                  }
+                  return false
+              }
+
+              /** All picture targets that are on screen right now (and not cooling down), with their click spot. */
+              private fun scanPictures(flex: Boolean): List<Hit> {
+                  val out = ArrayList<Hit>()
+                  val bmp = grab() ?: return out
+                  val found = ArrayList<Found>()
+                  synchronized(tplLock) {
+                      if (templates.isEmpty()) return out
+                      val frame = Frm(toGray(bmp))
+                      try {
+                          for (tpl in templates) {
+                              if (!ready("p" + tpl.t.id)) continue
+                              val thr = thrFor(tpl.t)
+                              val f = matchTpl(frame, tpl, thr, flex) ?: continue
+                              if (f.score >= thr) found.add(f)
+                          }
+                      } finally { frame.release() }
+                  }
+                  var lines: List<TextLine>? = null
+                  var ocrFailed = false
+                  for (f in found) {
+                      val t = f.t
+                      if (t.condMode > 0) {
+                          if (lines == null && !ocrFailed) {
+                              lines = try { ocr(300) } catch (e: Throwable) { null }
+                              if (lines == null) ocrFailed = true
+                          }
+                          val ls = lines ?: continue
+                          val vis = textVisible(t, ls)
+                          when (t.condMode) {
+                              1 -> f.alt = vis
+                              2 -> if (!vis) continue
+                              3 -> if (vis) continue
+                          }
+                      }
+                      out.add(Hit("p" + t.id, f.clickX(), f.clickY(), t.cooldownMs.toLong()))
+                  }
+                  return out
+              }
+
+              /** Enabled words found on screen (centre of each matching line). */
+              private fun scanText(): List<Hit> {
+                  val words = Store.words(this).filter { it.second }.map { it.first.trim().lowercase() }.filter { it.isNotEmpty() }
+                  if (words.isEmpty()) return emptyList()
+                  val lines = ocr(200) ?: return emptyList()
+                  val out = ArrayList<Hit>()
+                  for (l in lines) {
+                      val txt = l.text.lowercase()
+                      for (w in words) {
+                          if (txt == w || (txt.contains(w) && txt.length <= w.length + 8)) {
+                              val key = "w$w"
+                              if (ready(key) && out.none { it.key == key }) out.add(Hit(key, l.cx, l.cy, 1500L))
+                              break
+                          }
+                      }
+                  }
+                  return out
+              }
+
+              /** Every picture target (enabled or not) visible in this screenshot, for the editor. */
+              private fun matchAll(frameBmp: Bitmap, list: List<Target>): List<Found> {
+                  val frame = Frm(toGray(frameBmp))
+                  val out = ArrayList<Found>()
+                  try {
+                      for (t in list) {
+                          val bmp = Targets.bitmap(this, t) ?: continue
+                          val tpl = makeTpl(t, bmp)
+                          val thr = thrFor(t)
+                          val f = matchTpl(frame, tpl, thr, Store.flex(this))
+                          tpl.release()
+                          if (f != null && f.score >= thr) out.add(f)
+                      }
+                  } finally { frame.release() }
+                  return out
+              }
+
+              // ---------------------------------------------------------------- main loops
+
+              private fun updatePlay() {
+                  playIcon?.kind = if (running) Ic.PAUSE else Ic.PLAY
+                  playIcon?.invalidate()
+                  playWrap?.background = if (running) rounded(Theme.ACCENT, dpf(14f)) else null
+              }
+
+              private fun setRunning(on: Boolean) {
+                  if (on == running) return
+                  if (on) {
+                      if (ClickerAccessibility.instance == null) { toast("Accessibility service is OFF. Open the app."); return }
+                      running = true
+                      pendingHits = null
+                      holdUntil = 0L
+                      tapFails = 0
+                      val g = ++gen
+                      Thread { tapLoop(g) }.start()
+                      Thread { scanLoop(g) }.start()
+                  } else {
+                      running = false
+                      gen++
+                  }
+                  updatePlay()
+              }
+
+              private fun tapAt(acc: ClickerAccessibility, x: Float, y: Float) {
+                  val tx = x.coerceIn(1f, (sw - 2).toFloat().coerceAtLeast(2f))
+                  val ty = y.coerceIn(1f, (sh - 2).toFloat().coerceAtLeast(2f))
+                  if (acc.tap(tx, ty)) {
+                      tapFails = 0
+                  } else {
+                      tapFails++
+                      if (tapFails == 15) toast("The system is blocking taps. Open the app > Help tab (Xiaomi / POCO steps).")
+                  }
+              }
+
+              /** Taps: every button that was found first (each on its own cooldown), otherwise the farm points in turn. */
+              private fun tapLoop(g: Int) {
+                  var idx = 0
+                  while (running && g == gen) {
+                      val acc = ClickerAccessibility.instance
+                      if (acc == null) {
+                          running = false
+                          ui.post { updatePlay(); toast("Accessibility got turned off. Re-enable it in the app.") }
+                          return
+                      }
+                      val hs = pendingHits
+                      if (hs != null) {
+                          pendingHits = null
+                          for (h in hs) {
+                              if (!running || g != gen) break
+                              if (!ready(h.key)) continue
+                              tapAt(acc, h.x, h.y)
+                              markDone(h.key, h.cool)
+                              SystemClock.sleep(350)
+                          }
+                          holdUntil = SystemClock.uptimeMillis() + 300
+                          continue
+                      }
+                      val pts = Store.points(this)
+                      val pt = if (pts.isEmpty()) Pair(sw / 2f, sh / 2f) else pts[idx++ % pts.size]
+                      tapAt(acc, pt.first, pt.second)
+                      SystemClock.sleep((1000L / Store.cps(this)).coerceAtLeast(1L))
+                  }
+              }
+
+              /** Looks at the screen in parallel, so farming never slows down. */
+              private fun scanLoop(g: Int) {
+                  var n = 0
+                  var lastText = 0L
+                  while (running && g == gen) {
+                      val now = SystemClock.uptimeMillis()
+                      if (pendingHits == null && now >= holdUntil) {
+                          // exact look every scan, flexible (shape) matching every 3rd scan: lighter on battery
+                          val flex = Store.flex(this) && n % 3 == 0
+                          val found = ArrayList<Hit>()
+                          try { found.addAll(scanPictures(flex)) } catch (e: Throwable) { }
+                          if (found.isEmpty() && now - lastText >= Store.textMs(this)) {
+                              lastText = now
+                              try { found.addAll(scanText()) } catch (e: Throwable) { }
+                          }
+                          if (found.isNotEmpty() && g == gen) pendingHits = found
+                          n++
+                      }
+                      SystemClock.sleep(Store.scanMs(this))
+                  }
+              }
+
+              // ---------------------------------------------------------------- overlays
+
+              private fun overlayType() = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+              private fun fullScreenParams(touchable: Boolean): WindowManager.LayoutParams {
+                  var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                  if (!touchable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                      overlayType(), flags, PixelFormat.TRANSLUCENT
+                  )
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  }
+                  return lp
+              }
+
+              private fun applyMarkers() {
+                  if (markers == null) {
+                      val v = MarkersView(this) { Pair(sw, sh) }
+                      wm.addView(v, fullScreenParams(false))
+                      markers = v
+                  }
+                  markers?.visibility = if (Store.markers(this)) View.VISIBLE else View.GONE
+                  markers?.invalidate()
+                  eyeIcon?.color = if (Store.markers(this)) Theme.GOLD else Theme.ICON
+                  eyeIcon?.invalidate()
+              }
+
+              private fun barButton(kind: Int, onClick: () -> Unit): FrameLayout {
+                  val icon = IconView(this, kind)
+                  return FrameLayout(this).apply {
+                      addView(icon, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+                      layoutParams = LinearLayout.LayoutParams(dp(46), dp(46))
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                  }
+              }
+
+              private fun showPanel() {
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      overlayType(), WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = dp(4); y = dp(180) }
+
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = rounded(0xEE1C1445.toInt(), dpf(24f), Theme.ACCENT, dp(1))
+                      setPadding(dp(3), dp(4), dp(3), dp(4))
+                  }
+
+                  // drag handle
+                  val grip = barButton(Ic.GRIP) {}
+                  var dx = 0f; var dy = 0f; var sx = 0; var sy = 0
+                  grip.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { dx = e.rawX; dy = e.rawY; sx = lp.x; sy = lp.y }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = sx + (e.rawX - dx).toInt()
+                              lp.y = sy + (e.rawY - dy).toInt()
+                              wm.updateViewLayout(col, lp)
+                          }
+                      }
+                      true
+                  }
+                  col.addView(grip)
+
+                  val play = barButton(Ic.PLAY) { setRunning(!running) }
+                  playWrap = play
+                  playIcon = play.getChildAt(0) as IconView
+                  col.addView(play)
+
+                  col.addView(barButton(Ic.PENCIL) { openEditor() })
+
+                  val eye = barButton(Ic.EYE) {
+                      Store.setMarkers(this, !Store.markers(this))
+                      applyMarkers()
+                  }
+                  eyeIcon = eye.getChildAt(0) as IconView
+                  col.addView(eye)
+
+                  col.addView(barButton(Ic.SLIDERS) { openManager(null) })
+                  col.addView(barButton(Ic.CLOSE) { stopSelf() })
+
+                  wm.addView(col, lp)
+                  panel = col
+                  applyMarkers() // refresh eye colour
+              }
+
+              private fun restoreUi() {
+                  panel?.visibility = View.VISIBLE
+                  applyMarkers()
+              }
+
+              // ---------------------------------------------------------------- manager (everything, from the floating bar)
+
+              private val host = object : ManagerHost {
+                  override fun close() { closeManager() }
+                  override fun changed() { applyMarkers(); reloadAsync() }
+                  override fun newTarget() { openEditor(1, null) }
+                  override fun retake(t: Target) { openEditor(3, t) }
+                  override fun pickRegion(t: Target) { openEditor(2, t) }
+              }
+
+              private fun closeManager() {
+                  manager?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  manager = null
+                  reloadAsync()
+              }
+
+              private fun openManager(startId: String?) {
+                  if (manager != null || editor != null) return
+                  setRunning(false)
+                  val v = ManagerView(this, startId, host)
+                  val lp = WindowManager.LayoutParams(
+                      (sw * 0.94).toInt(), (sh * 0.84).toInt(),
+                      overlayType(), 0, PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.CENTER
+                      softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                  }
+                  wm.addView(v, lp)
+                  v.requestFocus()
+                  manager = v
+              }
+
+              // ---------------------------------------------------------------- editor
+
+              private fun closeEditor() {
+                  editor?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  editor = null
+                  restoreUi()
+              }
+
+              /** startMode: 0 = points + click dots, 1 = new picture, 2 = pick the text area of [tgt], 3 = retake the picture of [tgt]. */
+              private fun openEditor(startMode: Int = 0, tgt: Target? = null) {
+                  if (editor != null) return
+                  setRunning(false)
+                  closeManager()
+                  // hide our own overlays so they are not in the frozen screenshot
+                  panel?.visibility = View.GONE
+                  markers?.visibility = View.GONE
+                  ui.postDelayed({ buildEditor(startMode, tgt) }, 300)
+              }
+
+              private fun buildEditor(startMode: Int, tgt: Target?) {
+                  val frame = grab()
+                  if (frame == null) {
+                      toast("No screen image yet, try again")
+                      restoreUi()
+                      if (tgt != null) openManager(tgt.id)
+                      return
+                  }
+
+                  val targets = Targets.list(this).toMutableList()
+                  val pts = Store.points(this).map { PointF(it.first, it.second) }.toMutableList()
+                  val view = EditorView(this, frame, pts, emptyList())
+                  val hint = Ui.text(this, "", 13f, Theme.TEXT).apply {
+                      background = rounded(0xCC0F0A28.toInt(), dpf(12f))
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                  }
+                  var chipP: TextView? = null
+                  var chipT: TextView? = null
+                  var visible = 0
+
+                  fun setMode(m: Int) {
+                      view.mode = m
+                      chipP?.background = rounded(if (m == 0) Theme.ACCENT else Theme.CARD2, dpf(14f))
+                      chipT?.background = rounded(if (m == 1) Theme.ACCENT else Theme.CARD2, dpf(14f))
+                      hint.text = when {
+                          startMode == 2 -> "Drag a box around the area where the text appears."
+                          startMode == 3 -> "Drag a box tightly around the new picture for ${tgt?.name ?: "the target"}."
+                          m == 0 ->
+                              "Tap empty space: add a tap point. Drag a point to move it, drop it on the trash to delete. " +
+                                  "Drag a gold dot to change where a target is clicked (green = second spot). " +
+                                  "($visible of ${targets.size} targets visible now)"
+                          else -> "Drag a box tightly around the button you want to click."
+                      }
+                      view.invalidate()
+                  }
+
+                  fun rescan() {
+                      val snap = targets.toList()
+                      Thread {
+                          val found = try { matchAll(frame, snap) } catch (e: Exception) { emptyList() }
+                          ui.post {
+                              if (editor != null) {
+                                  view.found = found
+                                  visible = found.size
+                                  setMode(view.mode)
+                              }
+                          }
+                      }.start()
+                  }
+
+                  view.onBox = { r ->
+                      val l = r.left.toInt().coerceIn(0, frame.width - 1)
+                      val t = r.top.toInt().coerceIn(0, frame.height - 1)
+                      val rr = r.right.toInt().coerceIn(l + 1, frame.width)
+                      val bb = r.bottom.toInt().coerceIn(t + 1, frame.height)
+                      if (rr - l < 16 || bb - t < 16) {
+                          toast("Box too small, try again")
+                      } else if (startMode == 2 && tgt != null) {
+                          val w = frame.width.toFloat()
+                          val hh = frame.height.toFloat()
+                          targets.firstOrNull { it.id == tgt.id }?.let {
+                              it.regOn = true
+                              it.rl = l / w
+                              it.rt = t / hh
+                              it.rr = rr / w
+                              it.rb = bb / hh
+                          }
+                          Targets.saveAll(this, targets)
+                          toast("Area saved")
+                          ui.post { closeEditor(); openManager(tgt.id) }
+                      } else if (startMode == 3 && tgt != null) {
+                          val crop = Bitmap.createBitmap(frame, l, t, rr - l, bb - t)
+                          Targets.replaceImage(this, tgt, crop)
+                          toast("Picture replaced")
+                          ui.post { closeEditor(); openManager(tgt.id) }
+                      } else {
+                          val crop = Bitmap.createBitmap(frame, l, t, rr - l, bb - t)
+                          val tg = Targets.createImage(this, crop)
+                          tg.name = "Target ${targets.size + 1}"
+                          targets.add(tg)
+                          Targets.saveAll(this, targets)
+                          toast("Target added")
+                          if (startMode == 1) {
+                              ui.post { closeEditor(); openManager(tg.id) }
+                          } else {
+                              reloadAsync()
+                              rescan()
+                              setMode(0)
+                          }
+                      }
+                  }
+
+                  val root = FrameLayout(this)
+                  root.addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  val bar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  if (startMode < 2) {
+                      val cp = Ui.chip(this, "Points", true) { setMode(0) }
+                      val ct = Ui.chip(this, "New target", false) { setMode(1) }
+                      chipP = cp
+                      chipT = ct
+                      bar.addView(cp)
+                      bar.addView(View(this), LinearLayout.LayoutParams(dp(8), dp(1)))
+                      bar.addView(ct)
+                  }
+                  bar.addView(View(this), LinearLayout.LayoutParams(0, dp(1), 1f))
+                  bar.addView(Ui.iconBtn(this, Ic.CLOSE) {
+                      closeEditor()
+                      if (tgt != null) openManager(tgt.id)
+                  })
+                  if (startMode < 2) {
+                      bar.addView(Ui.iconBtn(this, Ic.CHECK, Theme.GOLD) {
+                          Store.setPoints(this, pts.map { Pair(it.x, it.y) })
+                          Targets.saveAll(this, targets)
+                          reloadAsync()
+                          closeEditor()
+                          toast("Saved")
+                      })
+                  }
+                  root.addView(bar, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP
+                  ).apply { topMargin = dp(36); leftMargin = dp(12); rightMargin = dp(12) })
+                  root.addView(hint, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP
+                  ).apply { topMargin = dp(92); leftMargin = dp(12); rightMargin = dp(12) })
+
+                  wm.addView(root, fullScreenParams(true))
+                  editor = root
+                  setMode(if (startMode == 1 || startMode >= 2) 1 else 0)
+                  rescan()
+              }
+
+              // ---------------------------------------------------------------- cleanup
+
+              override fun onDestroy() {
+                  running = false
+                  gen++
+                  editor?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  manager?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  markers?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  display?.release()
+                  reader?.close()
+                  projection?.stop()
+                  try { recognizer?.close() } catch (_: Throwable) {}
+                  instance = null
+                  super.onDestroy()
+              }
+          }
+          IC_EOF
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/EditorView.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
           import android.content.Context
           import android.graphics.Bitmap
-          import android.graphics.BitmapFactory
-          import org.json.JSONArray
-          import org.json.JSONObject
-          import java.io.File
-          import java.io.FileOutputStream
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PointF
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.hypot
+          import kotlin.math.max
+          import kotlin.math.min
 
-          /** One picture to look for. fx/fy = where inside the picture the click lands (0..1). */
-          class Target(
-              val id: String,
-              var name: String,
-              var enabled: Boolean = true,
-              var fx: Float = 0.5f,
-              var fy: Float = 0.5f
-          )
+          /** A target found on the frozen screenshot. Coordinates are screenshot pixels. */
+          class Found(val t: Target, val l: Float, val top: Float, val r: Float, val b: Float, val score: Double) {
+              /** true = use the second click spot of the target */
+              var alt = false
+              fun normX(): Float = l + (r - l) * t.fx
+              fun normY(): Float = top + (b - top) * t.fy
+              fun altX(): Float = l + (r - l) * t.ax
+              fun altY(): Float = top + (b - top) * t.ay
+              fun clickX(): Float = if (alt && t.altOn) altX() else normX()
+              fun clickY(): Float = if (alt && t.altOn) altY() else normY()
+          }
 
-          object Targets {
-              fun dir(c: Context): File = File(c.filesDir, "targets").apply { mkdirs() }
-              private fun image(c: Context, t: Target): File = File(dir(c), t.id + ".png")
+          /**
+           * Full-screen editor on top of a frozen screenshot.
+           *  mode 0: tap empty space = add tap point, drag a numbered point = move it (drop on trash = delete),
+           *          drag a gold dot = change where that target is clicked.
+           *  mode 1: drag a box = create a new target.
+           */
+          class EditorView(
+              c: Context,
+              private val bmp: Bitmap,
+              val points: MutableList<PointF>,
+              var found: List<Found>
+          ) : View(c) {
 
-              fun list(c: Context): List<Target> {
-                  val out = ArrayList<Target>()
-                  try {
-                      val f = File(dir(c), "meta.json")
-                      if (f.exists()) {
-                          val a = JSONArray(f.readText())
-                          for (i in 0 until a.length()) {
-                              val o = a.getJSONObject(i)
-                              val id = o.getString("id")
-                              if (File(dir(c), "$id.png").exists()) {
-                                  out.add(
-                                      Target(
-                                          id, o.optString("name", "Target"), o.optBoolean("on", true),
-                                          o.optDouble("fx", 0.5).toFloat(), o.optDouble("fy", 0.5).toFloat()
-                                      )
-                                  )
-                              }
+              var mode = 0
+              var onBox: ((RectF) -> Unit)? = null
+
+              private val fillP = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+              private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  typeface = Typeface.DEFAULT_BOLD
+              }
+              private val iconP = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              private var dragPoint = -1
+              private var dragDot = -1
+              private var dragAlt = false
+              private var tapCandidate = false
+              private var downX = 0f
+              private var downY = 0f
+              private var boxStart: PointF? = null
+              private var boxEnd: PointF? = null
+              private var overTrash = false
+
+              private fun sx(): Float = width.toFloat() / bmp.width
+              private fun sy(): Float = height.toFloat() / bmp.height
+
+              override fun onDraw(cv: Canvas) {
+                  val sx = sx()
+                  val sy = sy()
+                  val d = context.dpf(1f)
+                  cv.drawBitmap(bmp, null, RectF(0f, 0f, width.toFloat(), height.toFloat()), null)
+                  cv.drawColor(0x66000000)
+
+                  // targets that are visible on this screen
+                  for (f in found) {
+                      val box = RectF(f.l * sx, f.top * sy, f.r * sx, f.b * sy)
+                      strokeP.color = if (f.t.enabled) Theme.GOLD else Theme.MUTED
+                      strokeP.strokeWidth = 2.5f * d
+                      cv.drawRoundRect(box, 6 * d, 6 * d, strokeP)
+
+                      val label = "${f.t.name} ${(f.score * 100).toInt()}%"
+                      textP.textSize = 12 * d
+                      textP.color = Theme.TEXT
+                      val tw = textP.measureText(label) + 14 * d
+                      fillP.color = 0xCC000000.toInt()
+                      cv.drawRoundRect(RectF(box.left, box.top - 24 * d, box.left + tw, box.top - 3 * d), 6 * d, 6 * d, fillP)
+                      cv.drawText(label, box.left + tw / 2, box.top - 9 * d, textP)
+
+                      fun dot(px: Float, py: Float, col: Int, tag: String) {
+                          val cx = px * sx
+                          val cy = py * sy
+                          fillP.color = col
+                          cv.drawCircle(cx, cy, 9 * d, fillP)
+                          strokeP.color = Color.WHITE
+                          strokeP.strokeWidth = 2 * d
+                          cv.drawCircle(cx, cy, 9 * d, strokeP)
+                          strokeP.color = col
+                          cv.drawLine(cx - 18 * d, cy, cx - 12 * d, cy, strokeP); cv.drawLine(cx + 12 * d, cy, cx + 18 * d, cy, strokeP)
+                          cv.drawLine(cx, cy - 18 * d, cx, cy - 12 * d, strokeP); cv.drawLine(cx, cy + 12 * d, cx, cy + 18 * d, strokeP)
+                          if (tag.isNotEmpty()) {
+                              textP.textSize = 10 * d
+                              textP.color = Color.BLACK
+                              cv.drawText(tag, cx, cy + 3.5f * d, textP)
                           }
                       }
-                  } catch (e: Exception) { }
-                  return out
-              }
-
-              fun saveAll(c: Context, list: List<Target>) {
-                  val a = JSONArray()
-                  for (t in list) {
-                      a.put(
-                          JSONObject().put("id", t.id).put("name", t.name).put("on", t.enabled)
-                              .put("fx", t.fx.toDouble()).put("fy", t.fy.toDouble())
-                      )
+                      dot(f.normX(), f.normY(), Theme.GOLD, "")
+                      if (f.t.altOn) dot(f.altX(), f.altY(), Theme.OK, "2")
                   }
-                  File(dir(c), "meta.json").writeText(a.toString())
+
+                  // tap points
+                  points.forEachIndexed { i, p ->
+                      val x = p.x * sx
+                      val y = p.y * sy
+                      fillP.color = Theme.ACCENT
+                      cv.drawCircle(x, y, 15 * d, fillP)
+                      strokeP.color = Color.WHITE
+                      strokeP.strokeWidth = 2.5f * d
+                      cv.drawCircle(x, y, 15 * d, strokeP)
+                      textP.textSize = 14 * d
+                      textP.color = Color.WHITE
+                      cv.drawText("${i + 1}", x, y + 5 * d, textP)
+                  }
+
+                  // box being drawn
+                  val a = boxStart
+                  val b = boxEnd
+                  if (mode == 1 && a != null && b != null) {
+                      strokeP.color = Theme.GOLD
+                      strokeP.strokeWidth = 3 * d
+                      cv.drawRect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y), strokeP)
+                  }
+
+                  // trash zone while dragging a point
+                  if (dragPoint >= 0) {
+                      fillP.color = if (overTrash) 0xCCF87171.toInt() else 0x99000000.toInt()
+                      cv.drawRoundRect(RectF(width * 0.25f, height - 110 * d, width * 0.75f, height - 40 * d), 18 * d, 18 * d, fillP)
+                      Ic.draw(cv, Ic.TRASH, iconP, Theme.TEXT, width / 2f - 16 * d, height - 92 * d, 32 * d)
+                  }
               }
 
-              /** Writes the picture, returns the new Target (caller adds it to its list and calls saveAll). */
-              fun createImage(c: Context, crop: Bitmap): Target {
-                  val id = "t" + System.currentTimeMillis()
-                  FileOutputStream(File(dir(c), "$id.png")).use { crop.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                  return Target(id, "Target", true, 0.5f, 0.5f)
-              }
-
-              fun delete(c: Context, t: Target) {
-                  image(c, t).delete()
-                  saveAll(c, list(c).filter { it.id != t.id })
-              }
-
-              fun clear(c: Context) { dir(c).listFiles()?.forEach { it.delete() } }
-
-              fun bitmap(c: Context, t: Target): Bitmap? = BitmapFactory.decodeFile(image(c, t).path)
-          }
-          IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Profiles.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Profiles.kt <<'IC_EOF'
-          package com.autoclicker.imageclicker
-
-          import android.content.Context
-          import org.json.JSONObject
-          import java.io.File
-
-          /** Named snapshots of: targets (+ click points), tap points, speed, sensitivity, scan interval. */
-          object Profiles {
-              private fun root(c: Context): File = File(c.filesDir, "profiles").apply { mkdirs() }
-
-              fun safe(n: String): String = n.trim().replace(Regex("[^\\p{L}\\p{N} _-]"), "_").take(40)
-
-              fun list(c: Context): List<String> =
-                  root(c).listFiles { f -> f.isDirectory }?.map { it.name }?.sorted() ?: emptyList()
-
-              fun active(c: Context): String = Store.prefs(c).getString("active", "") ?: ""
-
-              fun save(c: Context, name: String): Boolean {
-                  val n = safe(name)
-                  if (n.isEmpty()) return false
-                  val d = File(root(c), n)
-                  d.deleteRecursively(); d.mkdirs()
-                  Targets.dir(c).listFiles()?.forEach { it.copyTo(File(d, it.name), true) }
-                  val cfg = JSONObject()
-                      .put("cps", Store.cps(c)).put("thr", Store.threshold(c)).put("scan", Store.scanMs(c).toInt())
-                      .put("pts", Store.prefs(c).getString("pts", "") ?: "")
-                      .put("words", Store.wordsRaw(c)).put("hasWords", Store.prefs(c).contains("words"))
-                      .put("flex", Store.flex(c)).put("textms", Store.textMs(c).toInt())
-                  File(d, "config.json").writeText(cfg.toString())
-                  Store.prefs(c).edit().putString("active", n).apply()
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val sx = sx()
+                  val sy = sy()
+                  val d = context.dpf(1f)
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          downX = e.x; downY = e.y
+                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
+                          if (mode == 0) {
+                              for (i in points.indices.reversed()) {
+                                  val p = points[i]
+                                  if (hypot(e.x - p.x * sx, e.y - p.y * sy) < 30 * d) { dragPoint = i; break }
+                              }
+                              if (dragPoint < 0) {
+                                  for (i in found.indices.reversed()) {
+                                      val f = found[i]
+                                      if (f.t.altOn && hypot(e.x - f.altX() * sx, e.y - f.altY() * sy) < 26 * d) { dragDot = i; dragAlt = true; break }
+                                      if (hypot(e.x - f.normX() * sx, e.y - f.normY() * sy) < 26 * d) { dragDot = i; dragAlt = false; break }
+                                  }
+                              }
+                              if (dragPoint < 0 && dragDot < 0) tapCandidate = true
+                          } else {
+                              boxStart = PointF(e.x, e.y)
+                              boxEnd = PointF(e.x, e.y)
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (hypot(e.x - downX, e.y - downY) > 10 * d) tapCandidate = false
+                          if (dragPoint >= 0) {
+                              points[dragPoint].set(
+                                  (e.x / sx).coerceIn(0f, bmp.width - 1f),
+                                  (e.y / sy).coerceIn(0f, bmp.height - 1f)
+                              )
+                              overTrash = e.y > height - 130 * d
+                          } else if (dragDot >= 0) {
+                              val f = found[dragDot]
+                              val nx = ((e.x / sx - f.l) / (f.r - f.l)).coerceIn(-5f, 6f)
+                              val ny = ((e.y / sy - f.top) / (f.b - f.top)).coerceIn(-5f, 6f)
+                              if (dragAlt) { f.t.ax = nx; f.t.ay = ny } else { f.t.fx = nx; f.t.fy = ny }
+                          } else if (mode == 1) {
+                              boxEnd = PointF(e.x, e.y)
+                          }
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (dragPoint >= 0) {
+                              if (overTrash) points.removeAt(dragPoint)
+                          } else if (dragDot >= 0) {
+                              // offset already updated while dragging
+                          } else if (mode == 0 && tapCandidate) {
+                              points.add(PointF((e.x / sx).coerceIn(0f, bmp.width - 1f), (e.y / sy).coerceIn(0f, bmp.height - 1f)))
+                          } else if (mode == 1) {
+                              val a = boxStart
+                              val b = boxEnd
+                              if (a != null && b != null) {
+                                  onBox?.invoke(RectF(min(a.x, b.x) / sx, min(a.y, b.y) / sy, max(a.x, b.x) / sx, max(a.y, b.y) / sy))
+                              }
+                              boxStart = null; boxEnd = null
+                          }
+                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
+                          boxStart = null; boxEnd = null
+                      }
+                  }
+                  invalidate()
                   return true
               }
+          }
 
-              fun load(c: Context, name: String): Boolean {
-                  val d = File(root(c), name)
-                  if (!d.isDirectory) return false
-                  Targets.clear(c)
-                  d.listFiles()?.forEach { if (it.name != "config.json") it.copyTo(File(Targets.dir(c), it.name), true) }
-                  try {
-                      val j = JSONObject(File(d, "config.json").readText())
-                      Store.setCps(c, j.optInt("cps", 15))
-                      Store.setThreshold(c, j.optInt("thr", 80))
-                      Store.setScanMs(c, j.optInt("scan", 500))
-                      Store.prefs(c).edit().putString("pts", j.optString("pts", "")).apply()
-                      if (j.optBoolean("hasWords", false)) Store.setWordsRaw(c, j.optString("words", "")) else Store.resetWords(c)
-                      Store.setFlex(c, j.optBoolean("flex", true))
-                      Store.setTextMs(c, j.optInt("textms", 1500))
-                  } catch (e: Exception) { }
-                  Store.prefs(c).edit().putString("active", name).apply()
-                  return true
+          /** Transparent overlay that shows numbered rings where the farm taps land. */
+          class MarkersView(c: Context, private val size: () -> Pair<Int, Int>) : View(c) {
+              private val fillP = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+              private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  typeface = Typeface.DEFAULT_BOLD
+                  color = Color.WHITE
               }
 
-              fun delete(c: Context, name: String) {
-                  File(root(c), name).deleteRecursively()
-                  if (active(c) == name) Store.prefs(c).edit().remove("active").apply()
+              override fun onDraw(cv: Canvas) {
+                  val d = context.dpf(1f)
+                  val sz = size()
+                  val kx = width.toFloat() / sz.first
+                  val ky = height.toFloat() / sz.second
+                  Store.points(context).forEachIndexed { i, p ->
+                      val x = p.first * kx
+                      val y = p.second * ky
+                      fillP.color = 0x667C5CFF
+                      cv.drawCircle(x, y, 16 * d, fillP)
+                      strokeP.color = Color.WHITE
+                      strokeP.strokeWidth = 2 * d
+                      cv.drawCircle(x, y, 16 * d, strokeP)
+                      textP.textSize = 13 * d
+                      cv.drawText("${i + 1}", x, y + 4.5f * d, textP)
+                  }
               }
           }
           IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Icons.kt)
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Icons.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -507,1155 +1438,6 @@ jobs:
               }
           }
           IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/Ui.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Ui.kt <<'IC_EOF'
-          package com.autoclicker.imageclicker
-
-          import android.content.Context
-          import android.content.res.ColorStateList
-          import android.graphics.Canvas
-          import android.graphics.Paint
-          import android.graphics.RectF
-          import android.graphics.Typeface
-          import android.graphics.Bitmap
-          import android.graphics.drawable.GradientDrawable
-          import android.view.Gravity
-          import android.view.MotionEvent
-          import android.view.View
-          import android.view.ViewGroup
-          import android.widget.FrameLayout
-          import android.widget.LinearLayout
-          import android.widget.SeekBar
-          import android.widget.TextView
-          import kotlin.math.min
-
-          object Theme {
-              val BG = 0xFF0F0A28.toInt()
-              val CARD = 0xFF1C1445.toInt()
-              val CARD2 = 0xFF2A1F63.toInt()
-              val ACCENT = 0xFF7C5CFF.toInt()
-              val GOLD = 0xFFFFC93C.toInt()
-              val TEXT = 0xFFF3F0FF.toInt()
-              val MUTED = 0xFFA79FD0.toInt()
-              val ICON = 0xFFEDE9FE.toInt()
-              val OK = 0xFF34D399.toInt()
-              val BAD = 0xFFF87171.toInt()
-          }
-
-          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-          fun Context.dpf(v: Float): Float = v * resources.displayMetrics.density
-
-          fun rounded(color: Int, radius: Float, stroke: Int = 0, strokeW: Int = 0): GradientDrawable =
-              GradientDrawable().apply {
-                  setColor(color)
-                  cornerRadius = radius
-                  if (strokeW > 0) setStroke(strokeW, stroke)
-              }
-
-          object Ui {
-              private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
-              private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
-
-              fun text(c: Context, t: String, size: Float = 15f, color: Int = Theme.TEXT, bold: Boolean = false): TextView =
-                  TextView(c).apply {
-                      text = t
-                      textSize = size
-                      setTextColor(color)
-                      if (bold) typeface = Typeface.DEFAULT_BOLD
-                  }
-
-              fun card(c: Context): LinearLayout = LinearLayout(c).apply {
-                  orientation = LinearLayout.VERTICAL
-                  background = rounded(Theme.CARD, c.dpf(18f))
-                  setPadding(c.dp(16), c.dp(14), c.dp(16), c.dp(14))
-                  layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = c.dp(12) }
-              }
-
-              fun gap(c: Context, h: Int): View = View(c).apply { layoutParams = LinearLayout.LayoutParams(MATCH, c.dp(h)) }
-
-              fun button(c: Context, label: String, primary: Boolean = true, icon: Int = -1, onClick: () -> Unit): View {
-                  val row = LinearLayout(c).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      gravity = Gravity.CENTER
-                      background = rounded(if (primary) Theme.ACCENT else Theme.CARD2, c.dpf(14f))
-                      setPadding(c.dp(14), c.dp(12), c.dp(14), c.dp(12))
-                      layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = c.dp(8) }
-                      isClickable = true
-                      setOnClickListener { onClick() }
-                  }
-                  if (icon >= 0) {
-                      row.addView(IconView(c, icon), LinearLayout.LayoutParams(c.dp(20), c.dp(20)).apply { rightMargin = c.dp(8) })
-                  }
-                  row.addView(text(c, label, 15f, Theme.TEXT, true))
-                  return row
-              }
-
-              fun chip(c: Context, label: String, selected: Boolean = true, onClick: () -> Unit): TextView =
-                  TextView(c).apply {
-                      text = label
-                      textSize = 13f
-                      setTextColor(Theme.TEXT)
-                      typeface = Typeface.DEFAULT_BOLD
-                      setPadding(c.dp(14), c.dp(7), c.dp(14), c.dp(7))
-                      background = rounded(if (selected) Theme.ACCENT else Theme.CARD2, c.dpf(14f))
-                      isClickable = true
-                      setOnClickListener { onClick() }
-                  }
-
-              fun iconBtn(c: Context, icon: Int, tint: Int = Theme.ICON, onClick: () -> Unit): View =
-                  FrameLayout(c).apply {
-                      background = rounded(Theme.CARD2, c.dpf(12f))
-                      isClickable = true
-                      setOnClickListener { onClick() }
-                      addView(IconView(c, icon, tint), FrameLayout.LayoutParams(c.dp(20), c.dp(20), Gravity.CENTER))
-                      layoutParams = LinearLayout.LayoutParams(c.dp(40), c.dp(40)).apply { leftMargin = c.dp(8) }
-                  }
-
-              fun slider(
-                  c: Context, parent: LinearLayout, title: String,
-                  lo: Int, hi: Int, step: Int, cur: Int, unit: String, save: (Int) -> Unit
-              ) {
-                  val label = text(c, "$title: $cur$unit", 14f, Theme.TEXT)
-                  label.setPadding(0, c.dp(10), 0, 0)
-                  parent.addView(label)
-                  val bar = SeekBar(c)
-                  bar.progressTintList = ColorStateList.valueOf(Theme.ACCENT)
-                  bar.progressBackgroundTintList = ColorStateList.valueOf(Theme.CARD2)
-                  bar.thumbTintList = ColorStateList.valueOf(Theme.GOLD)
-                  bar.max = (hi - lo) / step
-                  bar.progress = (cur - lo) / step
-                  bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                          val v = lo + p * step
-                          save(v)
-                          label.text = "$title: $v$unit"
-                      }
-                      override fun onStartTrackingTouch(sb: SeekBar?) {}
-                      override fun onStopTrackingTouch(sb: SeekBar?) {}
-                  })
-                  parent.addView(bar)
-              }
-          }
-
-          class ToggleView(c: Context, var on: Boolean, private val onChange: (Boolean) -> Unit) : View(c) {
-              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
-              init {
-                  isClickable = true
-                  setOnClickListener { on = !on; invalidate(); onChange(on) }
-              }
-              override fun onMeasure(w: Int, h: Int) {
-                  setMeasuredDimension(context.dp(46), context.dp(26))
-              }
-              override fun onDraw(cv: Canvas) {
-                  val w = width.toFloat()
-                  val h = height.toFloat()
-                  p.color = if (on) Theme.ACCENT else Theme.CARD2
-                  cv.drawRoundRect(RectF(0f, 0f, w, h), h / 2, h / 2, p)
-                  p.color = if (on) Theme.GOLD else Theme.MUTED
-                  val r = h / 2 - context.dpf(3f)
-                  cv.drawCircle(if (on) w - h / 2 else h / 2, h / 2, r, p)
-              }
-          }
-
-          /** Shows a target picture with a gold cross where the click lands. Interactive = tap to move the cross. */
-          class ThumbView(
-              c: Context,
-              private val bmp: Bitmap,
-              var fx: Float,
-              var fy: Float,
-              private val interactive: Boolean = false
-          ) : View(c) {
-              private val bp = Paint(Paint.FILTER_BITMAP_FLAG)
-              private val cp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  style = Paint.Style.STROKE
-                  color = Theme.GOLD
-                  strokeWidth = c.dpf(2f)
-              }
-              private val wp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  style = Paint.Style.STROKE
-                  color = 0xFF000000.toInt()
-                  strokeWidth = c.dpf(4f)
-              }
-
-              private fun dst(): RectF {
-                  val s = min(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
-                  val w = bmp.width * s
-                  val h = bmp.height * s
-                  val l = (width - w) / 2f
-                  val t = (height - h) / 2f
-                  return RectF(l, t, l + w, t + h)
-              }
-
-              override fun onDraw(cv: Canvas) {
-                  val r = dst()
-                  cv.drawBitmap(bmp, null, r, bp)
-                  val x = r.left + r.width() * fx
-                  val y = r.top + r.height() * fy
-                  val rad = context.dpf(8f)
-                  val tick = context.dpf(6f)
-                  for (pt in listOf(wp, cp)) {
-                      cv.drawCircle(x, y, rad, pt)
-                      cv.drawLine(x - rad - tick, y, x - rad, y, pt); cv.drawLine(x + rad, y, x + rad + tick, y, pt)
-                      cv.drawLine(x, y - rad - tick, x, y - rad, pt); cv.drawLine(x, y + rad, x, y + rad + tick, pt)
-                  }
-              }
-
-              override fun onTouchEvent(e: MotionEvent): Boolean {
-                  if (!interactive) return false
-                  val r = dst()
-                  fx = ((e.x - r.left) / r.width()).coerceIn(0f, 1f)
-                  fy = ((e.y - r.top) / r.height()).coerceIn(0f, 1f)
-                  invalidate()
-                  return true
-              }
-          }
-          IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/EditorView.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/EditorView.kt <<'IC_EOF'
-          package com.autoclicker.imageclicker
-
-          import android.content.Context
-          import android.graphics.Bitmap
-          import android.graphics.Canvas
-          import android.graphics.Color
-          import android.graphics.Paint
-          import android.graphics.PointF
-          import android.graphics.RectF
-          import android.graphics.Typeface
-          import android.view.MotionEvent
-          import android.view.View
-          import kotlin.math.hypot
-          import kotlin.math.max
-          import kotlin.math.min
-
-          /** A target found on the frozen screenshot. Coordinates are screenshot pixels. */
-          class Found(val t: Target, val l: Float, val top: Float, val r: Float, val b: Float, val score: Double) {
-              fun clickX(): Float = l + (r - l) * t.fx
-              fun clickY(): Float = top + (b - top) * t.fy
-          }
-
-          /**
-           * Full-screen editor on top of a frozen screenshot.
-           *  mode 0: tap empty space = add tap point, drag a numbered point = move it (drop on trash = delete),
-           *          drag a gold dot = change where that target is clicked.
-           *  mode 1: drag a box = create a new target.
-           */
-          class EditorView(
-              c: Context,
-              private val bmp: Bitmap,
-              val points: MutableList<PointF>,
-              var found: List<Found>
-          ) : View(c) {
-
-              var mode = 0
-              var onBox: ((RectF) -> Unit)? = null
-
-              private val fillP = Paint(Paint.ANTI_ALIAS_FLAG)
-              private val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-              private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  textAlign = Paint.Align.CENTER
-                  typeface = Typeface.DEFAULT_BOLD
-              }
-              private val iconP = Paint(Paint.ANTI_ALIAS_FLAG)
-
-              private var dragPoint = -1
-              private var dragDot = -1
-              private var tapCandidate = false
-              private var downX = 0f
-              private var downY = 0f
-              private var boxStart: PointF? = null
-              private var boxEnd: PointF? = null
-              private var overTrash = false
-
-              private fun sx(): Float = width.toFloat() / bmp.width
-              private fun sy(): Float = height.toFloat() / bmp.height
-
-              override fun onDraw(cv: Canvas) {
-                  val sx = sx()
-                  val sy = sy()
-                  val d = context.dpf(1f)
-                  cv.drawBitmap(bmp, null, RectF(0f, 0f, width.toFloat(), height.toFloat()), null)
-                  cv.drawColor(0x66000000)
-
-                  // targets that are visible on this screen
-                  for (f in found) {
-                      val box = RectF(f.l * sx, f.top * sy, f.r * sx, f.b * sy)
-                      strokeP.color = if (f.t.enabled) Theme.GOLD else Theme.MUTED
-                      strokeP.strokeWidth = 2.5f * d
-                      cv.drawRoundRect(box, 6 * d, 6 * d, strokeP)
-
-                      val label = "${f.t.name} ${(f.score * 100).toInt()}%"
-                      textP.textSize = 12 * d
-                      textP.color = Theme.TEXT
-                      val tw = textP.measureText(label) + 14 * d
-                      fillP.color = 0xCC000000.toInt()
-                      cv.drawRoundRect(RectF(box.left, box.top - 24 * d, box.left + tw, box.top - 3 * d), 6 * d, 6 * d, fillP)
-                      cv.drawText(label, box.left + tw / 2, box.top - 9 * d, textP)
-
-                      val cx = f.clickX() * sx
-                      val cy = f.clickY() * sy
-                      fillP.color = Theme.GOLD
-                      cv.drawCircle(cx, cy, 9 * d, fillP)
-                      strokeP.color = Color.WHITE
-                      strokeP.strokeWidth = 2 * d
-                      cv.drawCircle(cx, cy, 9 * d, strokeP)
-                      strokeP.color = Theme.GOLD
-                      cv.drawLine(cx - 18 * d, cy, cx - 12 * d, cy, strokeP); cv.drawLine(cx + 12 * d, cy, cx + 18 * d, cy, strokeP)
-                      cv.drawLine(cx, cy - 18 * d, cx, cy - 12 * d, strokeP); cv.drawLine(cx, cy + 12 * d, cx, cy + 18 * d, strokeP)
-                  }
-
-                  // tap points
-                  points.forEachIndexed { i, p ->
-                      val x = p.x * sx
-                      val y = p.y * sy
-                      fillP.color = Theme.ACCENT
-                      cv.drawCircle(x, y, 15 * d, fillP)
-                      strokeP.color = Color.WHITE
-                      strokeP.strokeWidth = 2.5f * d
-                      cv.drawCircle(x, y, 15 * d, strokeP)
-                      textP.textSize = 14 * d
-                      textP.color = Color.WHITE
-                      cv.drawText("${i + 1}", x, y + 5 * d, textP)
-                  }
-
-                  // box being drawn
-                  val a = boxStart
-                  val b = boxEnd
-                  if (mode == 1 && a != null && b != null) {
-                      strokeP.color = Theme.GOLD
-                      strokeP.strokeWidth = 3 * d
-                      cv.drawRect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y), strokeP)
-                  }
-
-                  // trash zone while dragging a point
-                  if (dragPoint >= 0) {
-                      fillP.color = if (overTrash) 0xCCF87171.toInt() else 0x99000000.toInt()
-                      cv.drawRoundRect(RectF(width * 0.25f, height - 110 * d, width * 0.75f, height - 40 * d), 18 * d, 18 * d, fillP)
-                      Ic.draw(cv, Ic.TRASH, iconP, Theme.TEXT, width / 2f - 16 * d, height - 92 * d, 32 * d)
-                  }
-              }
-
-              override fun onTouchEvent(e: MotionEvent): Boolean {
-                  val sx = sx()
-                  val sy = sy()
-                  val d = context.dpf(1f)
-                  when (e.action) {
-                      MotionEvent.ACTION_DOWN -> {
-                          downX = e.x; downY = e.y
-                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
-                          if (mode == 0) {
-                              for (i in points.indices.reversed()) {
-                                  val p = points[i]
-                                  if (hypot(e.x - p.x * sx, e.y - p.y * sy) < 30 * d) { dragPoint = i; break }
-                              }
-                              if (dragPoint < 0) {
-                                  for (i in found.indices.reversed()) {
-                                      val f = found[i]
-                                      if (hypot(e.x - f.clickX() * sx, e.y - f.clickY() * sy) < 26 * d) { dragDot = i; break }
-                                  }
-                              }
-                              if (dragPoint < 0 && dragDot < 0) tapCandidate = true
-                          } else {
-                              boxStart = PointF(e.x, e.y)
-                              boxEnd = PointF(e.x, e.y)
-                          }
-                      }
-                      MotionEvent.ACTION_MOVE -> {
-                          if (hypot(e.x - downX, e.y - downY) > 10 * d) tapCandidate = false
-                          if (dragPoint >= 0) {
-                              points[dragPoint].set(
-                                  (e.x / sx).coerceIn(0f, bmp.width - 1f),
-                                  (e.y / sy).coerceIn(0f, bmp.height - 1f)
-                              )
-                              overTrash = e.y > height - 130 * d
-                          } else if (dragDot >= 0) {
-                              val f = found[dragDot]
-                              f.t.fx = ((e.x / sx - f.l) / (f.r - f.l)).coerceIn(-0.2f, 1.2f)
-                              f.t.fy = ((e.y / sy - f.top) / (f.b - f.top)).coerceIn(-0.2f, 1.2f)
-                          } else if (mode == 1) {
-                              boxEnd = PointF(e.x, e.y)
-                          }
-                      }
-                      MotionEvent.ACTION_UP -> {
-                          if (dragPoint >= 0) {
-                              if (overTrash) points.removeAt(dragPoint)
-                          } else if (dragDot >= 0) {
-                              // offset already updated while dragging
-                          } else if (mode == 0 && tapCandidate) {
-                              points.add(PointF((e.x / sx).coerceIn(0f, bmp.width - 1f), (e.y / sy).coerceIn(0f, bmp.height - 1f)))
-                          } else if (mode == 1) {
-                              val a = boxStart
-                              val b = boxEnd
-                              if (a != null && b != null) {
-                                  onBox?.invoke(RectF(min(a.x, b.x) / sx, min(a.y, b.y) / sy, max(a.x, b.x) / sx, max(a.y, b.y) / sy))
-                              }
-                              boxStart = null; boxEnd = null
-                          }
-                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
-                      }
-                      MotionEvent.ACTION_CANCEL -> {
-                          dragPoint = -1; dragDot = -1; tapCandidate = false; overTrash = false
-                          boxStart = null; boxEnd = null
-                      }
-                  }
-                  invalidate()
-                  return true
-              }
-          }
-
-          /** Transparent overlay that shows numbered rings where the farm taps land. */
-          class MarkersView(c: Context, private val size: () -> Pair<Int, Int>) : View(c) {
-              private val fillP = Paint(Paint.ANTI_ALIAS_FLAG)
-              private val strokeP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-              private val textP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  textAlign = Paint.Align.CENTER
-                  typeface = Typeface.DEFAULT_BOLD
-                  color = Color.WHITE
-              }
-
-              override fun onDraw(cv: Canvas) {
-                  val d = context.dpf(1f)
-                  val sz = size()
-                  val kx = width.toFloat() / sz.first
-                  val ky = height.toFloat() / sz.second
-                  Store.points(context).forEachIndexed { i, p ->
-                      val x = p.first * kx
-                      val y = p.second * ky
-                      fillP.color = 0x667C5CFF
-                      cv.drawCircle(x, y, 16 * d, fillP)
-                      strokeP.color = Color.WHITE
-                      strokeP.strokeWidth = 2 * d
-                      cv.drawCircle(x, y, 16 * d, strokeP)
-                      textP.textSize = 13 * d
-                      cv.drawText("${i + 1}", x, y + 4.5f * d, textP)
-                  }
-              }
-          }
-          IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerAccessibility.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerAccessibility.kt <<'IC_EOF'
-          package com.autoclicker.imageclicker
-
-          import android.accessibilityservice.AccessibilityService
-          import android.accessibilityservice.GestureDescription
-          import android.content.Intent
-          import android.graphics.Path
-          import android.view.accessibility.AccessibilityEvent
-          import java.util.concurrent.CountDownLatch
-          import java.util.concurrent.TimeUnit
-
-          /** Only job: perform a tap at (x, y). */
-          class ClickerAccessibility : AccessibilityService() {
-
-              companion object {
-                  @Volatile var instance: ClickerAccessibility? = null
-              }
-
-              override fun onServiceConnected() { instance = this }
-
-              override fun onUnbind(intent: Intent?): Boolean {
-                  instance = null
-                  return super.onUnbind(intent)
-              }
-
-              override fun onDestroy() {
-                  instance = null
-                  super.onDestroy()
-              }
-
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-              override fun onInterrupt() {}
-
-              /** Blocking tap (call from a background thread). */
-              fun tap(x: Float, y: Float) {
-                  val path = Path().apply { moveTo(x, y) }
-                  val gesture = GestureDescription.Builder()
-                      .addStroke(GestureDescription.StrokeDescription(path, 0, 25))
-                      .build()
-                  val latch = CountDownLatch(1)
-                  val ok = dispatchGesture(gesture, object : GestureResultCallback() {
-                      override fun onCompleted(g: GestureDescription?) { latch.countDown() }
-                      override fun onCancelled(g: GestureDescription?) { latch.countDown() }
-                  }, null)
-                  if (ok) latch.await(300, TimeUnit.MILLISECONDS)
-              }
-          }
-          IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerService.kt)
-          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/ClickerService.kt <<'IC_EOF'
-          package com.autoclicker.imageclicker
-
-          import android.app.Notification
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.app.PendingIntent
-          import android.app.Service
-          import android.content.Context
-          import android.content.Intent
-          import android.content.res.Configuration
-          import android.content.pm.ServiceInfo
-          import android.graphics.Bitmap
-          import android.graphics.PixelFormat
-          import android.graphics.PointF
-          import android.hardware.display.DisplayManager
-          import android.hardware.display.VirtualDisplay
-          import android.media.ImageReader
-          import android.media.projection.MediaProjection
-          import android.media.projection.MediaProjectionManager
-          import android.os.Build
-          import android.os.Handler
-          import android.os.IBinder
-          import android.os.Looper
-          import android.os.SystemClock
-          import android.util.DisplayMetrics
-          import android.view.Gravity
-          import android.view.MotionEvent
-          import android.view.View
-          import android.view.WindowManager
-          import android.widget.FrameLayout
-          import android.widget.LinearLayout
-          import android.widget.TextView
-          import android.widget.Toast
-          import org.opencv.android.OpenCVLoader
-          import org.opencv.android.Utils
-          import com.google.android.gms.tasks.Tasks
-          import com.google.mlkit.vision.common.InputImage
-          import com.google.mlkit.vision.text.TextRecognition
-          import com.google.mlkit.vision.text.TextRecognizer
-          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-          import org.opencv.core.Core
-          import org.opencv.core.CvType
-          import org.opencv.core.Mat
-          import org.opencv.core.Size
-          import org.opencv.imgproc.Imgproc
-          import java.util.concurrent.TimeUnit
-
-          class ClickerService : Service() {
-
-              companion object {
-                  const val ACTION_STOP = "com.autoclicker.imageclicker.STOP"
-                  private const val CHANNEL = "clicker"
-                  private const val SCALE = 0.5 // match on half-size images (faster)
-                  @Volatile var instance: ClickerService? = null
-              }
-
-              /** One scaled copy of a target picture: grayscale + gradient (shape) map. */
-              private class Var(val gray: Mat, val grad: Mat)
-
-              private class Tpl(val t: Target, val vars: List<Var>) {
-                  fun release() { vars.forEach { it.gray.release(); it.grad.release() } }
-              }
-
-              /** Current screenshot prepared for matching (gradient map is built only when needed). */
-              private class Frm(val gray: Mat) {
-                  var grad: Mat? = null
-                  fun release() { gray.release(); grad?.release() }
-              }
-
-              private lateinit var wm: WindowManager
-              private val ui = Handler(Looper.getMainLooper())
-
-              private var projection: MediaProjection? = null
-              private var reader: ImageReader? = null
-              private var display: VirtualDisplay? = null
-              private var sw = 0
-              private var sh = 0
-              private var lastFrame: Bitmap? = null
-
-              private var panel: View? = null
-              private var markers: View? = null
-              private var editor: View? = null
-              private var quick: View? = null
-              private var playIcon: IconView? = null
-              private var playWrap: View? = null
-              private var eyeIcon: IconView? = null
-
-              @Volatile private var running = false
-              @Volatile private var gen = 0
-              @Volatile private var hit: Pair<Float, Float>? = null
-              @Volatile private var holdUntil = 0L
-              @Volatile private var templates: List<Tpl> = emptyList()
-              private var recognizer: TextRecognizer? = null
-
-              override fun onBind(intent: Intent?): IBinder? = null
-
-              override fun onCreate() {
-                  super.onCreate()
-                  instance = this
-                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-              }
-
-              private fun toast(t: String) { ui.post { Toast.makeText(this, t, Toast.LENGTH_SHORT).show() } }
-
-              /** Called by the app after profiles / targets changed. */
-              fun reload() {
-                  ui.post {
-                      loadTemplates()
-                      markers?.invalidate()
-                  }
-              }
-
-              override fun onConfigurationChanged(newConfig: Configuration) {
-                  super.onConfigurationChanged(newConfig)
-                  ui.postDelayed({ rebuildCapture() }, 400)
-              }
-
-              /** Screen rotated: resize the capture so screenshots and taps stay aligned. */
-              @Suppress("DEPRECATION")
-              private fun rebuildCapture() {
-                  val d = display ?: return
-                  val dm = DisplayMetrics()
-                  wm.defaultDisplay.getRealMetrics(dm)
-                  if (dm.widthPixels == sw && dm.heightPixels == sh) return
-                  sw = dm.widthPixels
-                  sh = dm.heightPixels
-                  val rd = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
-                  val old = reader
-                  synchronized(this) { reader = rd; lastFrame = null }
-                  d.resize(sw, sh, dm.densityDpi)
-                  d.surface = rd.surface
-                  old?.close()
-                  markers?.invalidate()
-              }
-
-              @Suppress("DEPRECATION")
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  if (intent == null || intent.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
-                  if (projection != null) return START_NOT_STICKY
-
-                  startForegroundCompat()
-
-                  if (!OpenCVLoader.initLocal()) { toast("OpenCV failed to load"); stopSelf(); return START_NOT_STICKY }
-
-                  val code = intent.getIntExtra("code", 0)
-                  val data = intent.getParcelableExtra<Intent>("data")
-                  if (data == null) { stopSelf(); return START_NOT_STICKY }
-
-                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                  val mp = mpm.getMediaProjection(code, data)
-                  projection = mp
-                  mp.registerCallback(object : MediaProjection.Callback() {
-                      override fun onStop() { ui.post { stopSelf() } }
-                  }, ui)
-
-                  val dm = DisplayMetrics()
-                  wm.defaultDisplay.getRealMetrics(dm)
-                  sw = dm.widthPixels
-                  sh = dm.heightPixels
-                  val rd = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2)
-                  reader = rd
-                  display = mp.createVirtualDisplay(
-                      "clicker", sw, sh, dm.densityDpi,
-                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null
-                  )
-
-                  loadTemplates()
-                  applyMarkers()
-                  showPanel()
-                  toast("Ready. Open your game and use the floating bar.")
-                  return START_NOT_STICKY
-              }
-
-              private fun startForegroundCompat() {
-                  val nm = getSystemService(NotificationManager::class.java)
-                  nm.createNotificationChannel(NotificationChannel(CHANNEL, "Image Clicker", NotificationManager.IMPORTANCE_LOW))
-                  val stop = PendingIntent.getService(
-                      this, 0, Intent(this, ClickerService::class.java).setAction(ACTION_STOP),
-                      PendingIntent.FLAG_IMMUTABLE
-                  )
-                  val n = Notification.Builder(this, CHANNEL)
-                      .setContentTitle("Image Clicker is running")
-                      .setContentText("Tap this notification to stop")
-                      .setSmallIcon(android.R.drawable.ic_media_play)
-                      .setContentIntent(stop)
-                      .build()
-                  if (Build.VERSION.SDK_INT >= 29) {
-                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-                  } else startForeground(1, n)
-              }
-
-              // ---------------------------------------------------------------- screen capture
-
-              @Synchronized
-              private fun grab(): Bitmap? {
-                  val img = reader?.acquireLatestImage()
-                  if (img != null) {
-                      try {
-                          val p = img.planes[0]
-                          val rowPad = p.rowStride - p.pixelStride * img.width
-                          val full = Bitmap.createBitmap(img.width + rowPad / p.pixelStride, img.height, Bitmap.Config.ARGB_8888)
-                          full.copyPixelsFromBuffer(p.buffer)
-                          lastFrame = Bitmap.createBitmap(full, 0, 0, img.width, img.height)
-                      } finally { img.close() }
-                  }
-                  return lastFrame
-              }
-
-              // ---------------------------------------------------------------- matching
-
-              private fun toGray(b: Bitmap): Mat {
-                  val m = Mat()
-                  Utils.bitmapToMat(b, m)
-                  Imgproc.cvtColor(m, m, Imgproc.COLOR_RGBA2GRAY)
-                  Imgproc.resize(m, m, Size(), SCALE, SCALE, Imgproc.INTER_AREA)
-                  return m
-              }
-
-              /** Edge strength map: matches the SHAPE even when colours or brightness differ. */
-              private fun gradient(gray: Mat): Mat {
-                  val g = Mat()
-                  gray.convertTo(g, CvType.CV_32F)
-                  val gx = Mat()
-                  val gy = Mat()
-                  Imgproc.Sobel(g, gx, CvType.CV_32F, 1, 0, 3)
-                  Imgproc.Sobel(g, gy, CvType.CV_32F, 0, 1, 3)
-                  val mag = Mat()
-                  Core.magnitude(gx, gy, mag)
-                  g.release(); gx.release(); gy.release()
-                  return mag
-              }
-
-              private fun makeTpl(t: Target, bmp: Bitmap): Tpl {
-                  val g = toGray(bmp)
-                  val vars = ArrayList<Var>()
-                  vars.add(Var(g, gradient(g)))
-                  if (Store.flex(this)) {
-                      // same picture a bit smaller / bigger
-                      for (s in listOf(0.8, 1.25, 0.65, 1.5)) {
-                          val o = Mat()
-                          Imgproc.resize(g, o, Size(), s, s, if (s < 1.0) Imgproc.INTER_AREA else Imgproc.INTER_LINEAR)
-                          if (o.cols() < 8 || o.rows() < 8) { o.release(); continue }
-                          vars.add(Var(o, gradient(o)))
-                      }
-                  }
-                  return Tpl(t, vars)
-              }
-
-              private fun loadTemplates() {
-                  templates = Targets.list(this).filter { it.enabled }.mapNotNull { t ->
-                      Targets.bitmap(this, t)?.let { makeTpl(t, it) }
-                  }
-              }
-
-              private fun matchMat(src: Mat, tpl: Mat, t: Target): Found? {
-                  if (tpl.cols() > src.cols() || tpl.rows() > src.rows()) return null
-                  val r = Mat()
-                  Imgproc.matchTemplate(src, tpl, r, Imgproc.TM_CCOEFF_NORMED)
-                  val mm = Core.minMaxLoc(r)
-                  r.release()
-                  val x = mm.maxLoc.x
-                  val y = mm.maxLoc.y
-                  return Found(
-                      t,
-                      (x / SCALE).toFloat(), (y / SCALE).toFloat(),
-                      ((x + tpl.cols()) / SCALE).toFloat(), ((y + tpl.rows()) / SCALE).toFloat(),
-                      mm.maxVal
-                  )
-              }
-
-              /**
-               * 1) exact look (grayscale, original size)
-               * 2) if flex: same shape in other sizes / colours (edge map at several scales)
-               */
-              private fun matchTpl(frame: Frm, tpl: Tpl, thr: Double, flex: Boolean): Found? {
-                  var best = matchMat(frame.gray, tpl.vars[0].gray, tpl.t)
-                  if (best != null && best.score >= thr) return best
-                  if (flex) {
-                      val fg = frame.grad ?: gradient(frame.gray).also { frame.grad = it }
-                      for (v in tpl.vars) {
-                          val f = matchMat(fg, v.grad, tpl.t) ?: continue
-                          if (f.score >= thr) return f
-                          if (best == null || f.score > best.score) best = f
-                      }
-                  }
-                  return best
-              }
-
-              /** Click position of the first picture target seen on screen, or null. */
-              private fun scanPictures(flex: Boolean): Pair<Float, Float>? {
-                  val tpls = templates
-                  if (tpls.isEmpty()) return null
-                  val bmp = grab() ?: return null
-                  val frame = Frm(toGray(bmp))
-                  try {
-                      val thr = Store.threshold(this) / 100.0
-                      for (t in tpls) {
-                          val f = matchTpl(frame, t, thr, flex) ?: continue
-                          if (f.score >= thr) return Pair(f.clickX(), f.clickY())
-                      }
-                  } finally { frame.release() }
-                  return null
-              }
-
-              /** Reads the screen text (offline OCR) and returns the centre of the first enabled word found. */
-              private fun scanText(): Pair<Float, Float>? {
-                  val words = Store.words(this).filter { it.second }.map { it.first.trim().lowercase() }.filter { it.isNotEmpty() }
-                  if (words.isEmpty()) return null
-                  val bmp = grab() ?: return null
-                  val rec = recognizer ?: TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).also { recognizer = it }
-                  val res = Tasks.await(rec.process(InputImage.fromBitmap(bmp, 0)), 4, TimeUnit.SECONDS)
-                  for (block in res.textBlocks) {
-                      for (line in block.lines) {
-                          val txt = line.text.trim().lowercase()
-                          val box = line.boundingBox ?: continue
-                          for (w in words) {
-                              if (txt == w || (txt.contains(w) && txt.length <= w.length + 8)) {
-                                  return Pair(box.exactCenterX(), box.exactCenterY())
-                              }
-                          }
-                      }
-                  }
-                  return null
-              }
-
-              /** Every picture target (enabled or not) visible in this screenshot, for the editor. */
-              private fun matchAll(frameBmp: Bitmap, list: List<Target>): List<Found> {
-                  val frame = Frm(toGray(frameBmp))
-                  val thr = Store.threshold(this) / 100.0
-                  val out = ArrayList<Found>()
-                  try {
-                      for (t in list) {
-                          val bmp = Targets.bitmap(this, t) ?: continue
-                          val tpl = makeTpl(t, bmp)
-                          val f = matchTpl(frame, tpl, thr, Store.flex(this))
-                          tpl.release()
-                          if (f != null && f.score >= thr) out.add(f)
-                      }
-                  } finally { frame.release() }
-                  return out
-              }
-
-              // ---------------------------------------------------------------- main loops
-
-              private fun updatePlay() {
-                  playIcon?.kind = if (running) Ic.PAUSE else Ic.PLAY
-                  playIcon?.invalidate()
-                  playWrap?.background = if (running) rounded(Theme.ACCENT, dpf(14f)) else null
-              }
-
-              private fun setRunning(on: Boolean) {
-                  if (on == running) return
-                  if (on) {
-                      if (ClickerAccessibility.instance == null) { toast("Accessibility service is OFF. Open the app."); return }
-                      running = true
-                      hit = null
-                      holdUntil = 0L
-                      val g = ++gen
-                      Thread { tapLoop(g) }.start()
-                      Thread { scanLoop(g) }.start()
-                  } else {
-                      running = false
-                      gen++
-                  }
-                  updatePlay()
-              }
-
-              /** Taps: a found button first, otherwise the farm tap points in turn. */
-              private fun tapLoop(g: Int) {
-                  var idx = 0
-                  while (running && g == gen) {
-                      val acc = ClickerAccessibility.instance
-                      if (acc == null) {
-                          running = false
-                          ui.post { updatePlay(); toast("Accessibility got turned off. Re-enable it in the app.") }
-                          return
-                      }
-                      val h = hit
-                      if (h != null) {
-                          hit = null
-                          holdUntil = SystemClock.uptimeMillis() + 1000
-                          acc.tap(h.first, h.second)
-                          SystemClock.sleep(700)
-                          continue
-                      }
-                      val pts = Store.points(this)
-                      val pt = if (pts.isEmpty()) Pair(sw / 2f, sh / 2f) else pts[idx++ % pts.size]
-                      acc.tap(pt.first, pt.second)
-                      SystemClock.sleep((1000L / Store.cps(this)).coerceAtLeast(1L))
-                  }
-              }
-
-              /** Looks at the screen in parallel, so farming never slows down. */
-              private fun scanLoop(g: Int) {
-                  var n = 0
-                  var lastText = 0L
-                  while (running && g == gen) {
-                      val now = SystemClock.uptimeMillis()
-                      if (hit == null && now >= holdUntil) {
-                          // exact look every scan, flexible (shape) matching every 3rd scan: lighter on battery
-                          val flex = Store.flex(this) && n % 3 == 0
-                          var found: Pair<Float, Float>? = try { scanPictures(flex) } catch (e: Throwable) { null }
-                          if (found == null && now - lastText >= Store.textMs(this)) {
-                              lastText = now
-                              found = try { scanText() } catch (e: Throwable) { null }
-                          }
-                          if (found != null && g == gen) hit = found
-                          n++
-                      }
-                      SystemClock.sleep(Store.scanMs(this))
-                  }
-              }
-
-              // ---------------------------------------------------------------- overlays
-
-              private fun overlayType() = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-
-              private fun fullScreenParams(touchable: Boolean): WindowManager.LayoutParams {
-                  var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                  if (!touchable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                  val lp = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
-                      overlayType(), flags, PixelFormat.TRANSLUCENT
-                  )
-                  if (Build.VERSION.SDK_INT >= 28) {
-                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                  }
-                  return lp
-              }
-
-              private fun applyMarkers() {
-                  if (markers == null) {
-                      val v = MarkersView(this) { Pair(sw, sh) }
-                      wm.addView(v, fullScreenParams(false))
-                      markers = v
-                  }
-                  markers?.visibility = if (Store.markers(this)) View.VISIBLE else View.GONE
-                  markers?.invalidate()
-                  eyeIcon?.color = if (Store.markers(this)) Theme.GOLD else Theme.ICON
-                  eyeIcon?.invalidate()
-              }
-
-              private fun barButton(kind: Int, onClick: () -> Unit): FrameLayout {
-                  val icon = IconView(this, kind)
-                  return FrameLayout(this).apply {
-                      addView(icon, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
-                      layoutParams = LinearLayout.LayoutParams(dp(46), dp(46))
-                      isClickable = true
-                      setOnClickListener { onClick() }
-                  }
-              }
-
-              private fun showPanel() {
-                  val lp = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
-                      overlayType(), WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
-                  ).apply { gravity = Gravity.TOP or Gravity.START; x = dp(4); y = dp(180) }
-
-                  val col = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      background = rounded(0xEE1C1445.toInt(), dpf(24f), Theme.ACCENT, dp(1))
-                      setPadding(dp(3), dp(4), dp(3), dp(4))
-                  }
-
-                  // drag handle
-                  val grip = barButton(Ic.GRIP) {}
-                  var dx = 0f; var dy = 0f; var sx = 0; var sy = 0
-                  grip.setOnTouchListener { _, e ->
-                      when (e.action) {
-                          MotionEvent.ACTION_DOWN -> { dx = e.rawX; dy = e.rawY; sx = lp.x; sy = lp.y }
-                          MotionEvent.ACTION_MOVE -> {
-                              lp.x = sx + (e.rawX - dx).toInt()
-                              lp.y = sy + (e.rawY - dy).toInt()
-                              wm.updateViewLayout(col, lp)
-                          }
-                      }
-                      true
-                  }
-                  col.addView(grip)
-
-                  val play = barButton(Ic.PLAY) { setRunning(!running) }
-                  playWrap = play
-                  playIcon = play.getChildAt(0) as IconView
-                  col.addView(play)
-
-                  col.addView(barButton(Ic.PENCIL) { openEditor() })
-
-                  val eye = barButton(Ic.EYE) {
-                      Store.setMarkers(this, !Store.markers(this))
-                      applyMarkers()
-                  }
-                  eyeIcon = eye.getChildAt(0) as IconView
-                  col.addView(eye)
-
-                  col.addView(barButton(Ic.SLIDERS) { openQuick() })
-                  col.addView(barButton(Ic.CLOSE) { stopSelf() })
-
-                  wm.addView(col, lp)
-                  panel = col
-                  applyMarkers() // refresh eye colour
-              }
-
-              private fun restoreUi() {
-                  panel?.visibility = View.VISIBLE
-                  applyMarkers()
-              }
-
-              // ---------------------------------------------------------------- quick settings
-
-              private fun closeQuick() {
-                  quick?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  quick = null
-              }
-
-              private fun openQuick() {
-                  if (quick != null || editor != null) return
-                  setRunning(false)
-                  val card = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      background = rounded(0xF01C1445.toInt(), dpf(18f), Theme.ACCENT, dp(1))
-                      setPadding(dp(18), dp(14), dp(18), dp(14))
-                  }
-                  card.addView(Ui.text(this, "Quick settings", 18f, Theme.TEXT, true))
-                  Ui.slider(this, card, "Taps per second", 5, 30, 1, Store.cps(this), "") { Store.setCps(this, it) }
-                  Ui.slider(this, card, "Match sensitivity (lower = more tolerant)", 60, 95, 1, Store.threshold(this), "%") { Store.setThreshold(this, it) }
-                  Ui.slider(this, card, "Look for targets every", 200, 2000, 100, Store.scanMs(this).toInt(), " ms") { Store.setScanMs(this, it) }
-                  card.addView(Ui.gap(this, 10))
-                  card.addView(Ui.button(this, "Close", false) { closeQuick() })
-                  val lp = WindowManager.LayoutParams(
-                      (sw * 0.88).toInt(), WindowManager.LayoutParams.WRAP_CONTENT,
-                      overlayType(), WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
-                  ).apply { gravity = Gravity.CENTER }
-                  wm.addView(card, lp)
-                  quick = card
-              }
-
-              // ---------------------------------------------------------------- editor
-
-              private fun closeEditor() {
-                  editor?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  editor = null
-                  restoreUi()
-              }
-
-              private fun openEditor() {
-                  if (editor != null) return
-                  setRunning(false)
-                  closeQuick()
-                  // hide our own overlays so they are not in the frozen screenshot
-                  panel?.visibility = View.GONE
-                  markers?.visibility = View.GONE
-                  ui.postDelayed({ buildEditor() }, 300)
-              }
-
-              private fun buildEditor() {
-                  val frame = grab()
-                  if (frame == null) { toast("No screen image yet, try again"); restoreUi(); return }
-
-                  val targets = Targets.list(this).toMutableList()
-                  val pts = Store.points(this).map { PointF(it.first, it.second) }.toMutableList()
-                  val view = EditorView(this, frame, pts, emptyList())
-                  val hint = Ui.text(this, "", 13f, Theme.TEXT).apply {
-                      background = rounded(0xCC0F0A28.toInt(), dpf(12f))
-                      setPadding(dp(12), dp(8), dp(12), dp(8))
-                  }
-                  var chipP: TextView? = null
-                  var chipT: TextView? = null
-                  var visible = 0
-
-                  fun setMode(m: Int) {
-                      view.mode = m
-                      chipP?.background = rounded(if (m == 0) Theme.ACCENT else Theme.CARD2, dpf(14f))
-                      chipT?.background = rounded(if (m == 1) Theme.ACCENT else Theme.CARD2, dpf(14f))
-                      hint.text = if (m == 0) {
-                          "Tap empty space: add a tap point. Drag a point to move it, drop it on the trash to delete. " +
-                              "Drag a gold dot to change where a target is clicked. ($visible of ${targets.size} targets visible now)"
-                      } else {
-                          "Drag a box tightly around the button you want to click."
-                      }
-                      view.invalidate()
-                  }
-
-                  fun rescan() {
-                      val snap = targets.toList()
-                      Thread {
-                          val found = try { matchAll(frame, snap) } catch (e: Exception) { emptyList() }
-                          ui.post {
-                              if (editor != null) {
-                                  view.found = found
-                                  visible = found.size
-                                  setMode(view.mode)
-                              }
-                          }
-                      }.start()
-                  }
-
-                  view.onBox = { r ->
-                      val l = r.left.toInt().coerceIn(0, frame.width - 1)
-                      val t = r.top.toInt().coerceIn(0, frame.height - 1)
-                      val rr = r.right.toInt().coerceIn(l + 1, frame.width)
-                      val bb = r.bottom.toInt().coerceIn(t + 1, frame.height)
-                      if (rr - l < 16 || bb - t < 16) {
-                          toast("Box too small, try again")
-                      } else {
-                          val crop = Bitmap.createBitmap(frame, l, t, rr - l, bb - t)
-                          val tg = Targets.createImage(this, crop)
-                          tg.name = "Target ${targets.size + 1}"
-                          targets.add(tg)
-                          Targets.saveAll(this, targets)
-                          loadTemplates()
-                          rescan()
-                          setMode(0)
-                          toast("Target added")
-                      }
-                  }
-
-                  val root = FrameLayout(this)
-                  root.addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-
-                  val bar = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      gravity = Gravity.CENTER_VERTICAL
-                  }
-                  val cp = Ui.chip(this, "Points", true) { setMode(0) }
-                  val ct = Ui.chip(this, "New target", false) { setMode(1) }
-                  chipP = cp
-                  chipT = ct
-                  bar.addView(cp)
-                  bar.addView(View(this), LinearLayout.LayoutParams(dp(8), dp(1)))
-                  bar.addView(ct)
-                  bar.addView(View(this), LinearLayout.LayoutParams(0, dp(1), 1f))
-                  bar.addView(Ui.iconBtn(this, Ic.CLOSE) { closeEditor() })
-                  bar.addView(Ui.iconBtn(this, Ic.CHECK, Theme.GOLD) {
-                      Store.setPoints(this, pts.map { Pair(it.x, it.y) })
-                      Targets.saveAll(this, targets)
-                      loadTemplates()
-                      closeEditor()
-                      toast("Saved")
-                  })
-                  root.addView(bar, FrameLayout.LayoutParams(
-                      FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP
-                  ).apply { topMargin = dp(36); leftMargin = dp(12); rightMargin = dp(12) })
-                  root.addView(hint, FrameLayout.LayoutParams(
-                      FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP
-                  ).apply { topMargin = dp(92); leftMargin = dp(12); rightMargin = dp(12) })
-
-                  wm.addView(root, fullScreenParams(true))
-                  editor = root
-                  setMode(0)
-                  rescan()
-              }
-
-              // ---------------------------------------------------------------- cleanup
-
-              override fun onDestroy() {
-                  running = false
-                  gen++
-                  editor?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  quick?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  markers?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-                  display?.release()
-                  reader?.close()
-                  projection?.stop()
-                  try { recognizer?.close() } catch (_: Throwable) {}
-                  instance = null
-                  super.onDestroy()
-              }
-          }
-          IC_EOF
-          mkdir -p $(dirname ic-android/app/src/main/java/com/autoclicker/imageclicker/MainActivity.kt)
           cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/MainActivity.kt <<'IC_EOF'
           package com.autoclicker.imageclicker
 
@@ -1929,7 +1711,8 @@ jobs:
                           ctx,
                           "Targets are pictures the app clicks whenever it sees them (Claim, ❌, Skip, Close). " +
                               "Add them with the pencil button on the floating bar while your game is open. " +
-                              "The gold cross shows where the click lands. Tap a picture's pencil to move it.",
+                              "The gold cross shows where the click lands. Tap the sliders button on the floating bar to edit " +
+                              "pictures, click spots, text conditions and all settings without leaving your game.",
                           13f, Theme.MUTED
                       )
                   )
@@ -2325,6 +2108,922 @@ jobs:
                   }
               }
           }
+          IC_EOF
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Manager.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.graphics.Typeface
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.roundToInt
+
+          /** What the manager needs from the floating-bar service. */
+          interface ManagerHost {
+              fun close()
+              fun changed()
+              fun newTarget()
+              fun retake(t: Target)
+              fun pickRegion(t: Target)
+          }
+
+          /**
+           * Everything you can change, shown on top of the game (no need to open the app):
+           * Targets (picture, click spot, second spot, text condition, sensitivity, wait),
+           * Words, Settings, Profiles.
+           */
+          class ManagerView(c: Context, startId: String?, private val host: ManagerHost) : FrameLayout(c) {
+
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+              private var tab = 0
+              private var openId: String? = startId
+              private var targets: MutableList<Target> = Targets.list(c).toMutableList()
+              private val tabBar = LinearLayout(c)
+              private val body = FrameLayout(c)
+
+              private fun dp(v: Int): Int = context.dp(v)
+
+              init {
+                  background = rounded(0xF2161036.toInt(), c.dpf(20f), Theme.ACCENT, c.dp(1))
+                  isFocusableInTouchMode = true
+                  setOnKeyListener { _, code, ev ->
+                      if (code == KeyEvent.KEYCODE_BACK && ev.action == KeyEvent.ACTION_UP) { back(); true } else false
+                  }
+                  val col = LinearLayout(c).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(14), dp(12), dp(14), dp(12))
+                  }
+                  val head = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  head.addView(Ui.text(c, "Manage", 18f, Theme.TEXT, true), LinearLayout.LayoutParams(0, WRAP, 1f))
+                  head.addView(Ui.iconBtn(c, Ic.CLOSE) { host.close() })
+                  col.addView(head)
+                  tabBar.orientation = LinearLayout.HORIZONTAL
+                  col.addView(tabBar, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8); bottomMargin = dp(8) })
+                  col.addView(body, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                  addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
+                  render()
+              }
+
+              private fun persist() { Targets.saveAll(context, targets) }
+
+              private fun back() {
+                  if (tab == 0 && openId != null) { openId = null; render() } else host.close()
+              }
+
+              // ------------------------------------------------------------------ shell
+
+              private fun renderTabs() {
+                  tabBar.removeAllViews()
+                  listOf("Targets", "Words", "Settings", "Profiles").forEachIndexed { i, name ->
+                      val on = i == tab
+                      tabBar.addView(
+                          TextView(context).apply {
+                              text = name
+                              textSize = 12f
+                              gravity = Gravity.CENTER
+                              typeface = Typeface.DEFAULT_BOLD
+                              setTextColor(if (on) Theme.BG else Theme.TEXT)
+                              setPadding(0, dp(8), 0, dp(8))
+                              background = rounded(if (on) Theme.GOLD else Theme.CARD2, context.dpf(12f))
+                              isClickable = true
+                              setOnClickListener { tab = i; openId = null; render() }
+                          },
+                          LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(3); rightMargin = dp(3) }
+                      )
+                  }
+              }
+
+              private fun render() {
+                  renderTabs()
+                  body.removeAllViews()
+                  val cur = openId?.let { id -> targets.firstOrNull { it.id == id } }
+                  val content = LinearLayout(context).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(0, dp(2), 0, dp(12))
+                  }
+                  when {
+                      tab == 0 && cur != null -> detail(content, cur)
+                      tab == 0 -> targetList(content)
+                      tab == 1 -> wordsTab(content)
+                      tab == 2 -> settingsTab(content)
+                      else -> profilesTab(content)
+                  }
+                  body.addView(
+                      ScrollView(context).apply {
+                          isVerticalScrollBarEnabled = false
+                          addView(content)
+                      },
+                      FrameLayout.LayoutParams(MATCH, MATCH)
+                  )
+              }
+
+              // ------------------------------------------------------------------ small builders
+
+              private fun section(p: LinearLayout, title: String) {
+                  p.addView(Ui.text(context, title, 15f, Theme.GOLD, true).apply { setPadding(0, dp(14), 0, dp(2)) })
+              }
+
+              private fun toggleRow(parent: LinearLayout, title: String, sub: String, on: Boolean, onChange: (Boolean) -> Unit) {
+                  val c = context
+                  val r = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+                  val tx = LinearLayout(c).apply { orientation = LinearLayout.VERTICAL }
+                  tx.addView(Ui.text(c, title, 14f))
+                  if (sub.isNotEmpty()) tx.addView(Ui.text(c, sub, 11f, Theme.MUTED))
+                  r.addView(tx, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  r.addView(ToggleView(c, on, onChange))
+                  parent.addView(r)
+              }
+
+              private fun pctSlider(parent: LinearLayout, title: String, cur: Float, save: (Float) -> Unit) {
+                  val v = ((cur * 100f) / 5f).roundToInt() * 5
+                  Ui.slider(context, parent, title, -400, 500, 5, v.coerceIn(-400, 500), "%") { save(it / 100f) }
+              }
+
+              private fun choice(parent: LinearLayout, options: List<String>, sel: Int, onSel: (Int) -> Unit) {
+                  val views = ArrayList<TextView>()
+                  fun paint(s: Int) {
+                      views.forEachIndexed { i, v -> v.background = rounded(if (i == s) Theme.ACCENT else Theme.CARD2, context.dpf(12f)) }
+                  }
+                  options.forEachIndexed { i, o ->
+                      val v = TextView(context).apply {
+                          text = o
+                          textSize = 13f
+                          setTextColor(Theme.TEXT)
+                          setPadding(dp(12), dp(10), dp(12), dp(10))
+                          isClickable = true
+                          setOnClickListener { paint(i); onSel(i) }
+                      }
+                      views.add(v)
+                      parent.addView(v, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(6) })
+                  }
+                  paint(sel)
+              }
+
+              private fun edit(initial: String, hintText: String, onChange: (String) -> Unit): EditText =
+                  EditText(context).apply {
+                      setText(initial)
+                      hint = hintText
+                      setHintTextColor(Theme.MUTED)
+                      setTextColor(Theme.TEXT)
+                      textSize = 14f
+                      setSingleLine()
+                      background = rounded(Theme.CARD2, context.dpf(10f))
+                      setPadding(dp(12), dp(10), dp(12), dp(10))
+                      addTextChangedListener(object : TextWatcher {
+                          override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+                          override fun onTextChanged(s: CharSequence?, a: Int, b: Int, n: Int) {}
+                          override fun afterTextChanged(s: Editable?) { onChange(s?.toString() ?: "") }
+                      })
+                  }
+
+              private fun toast(t: String) { Toast.makeText(context, t, Toast.LENGTH_SHORT).show() }
+
+              // ------------------------------------------------------------------ targets
+
+              private fun summary(t: Target): String {
+                  val cond = when (t.condMode) {
+                      1 -> " · 2nd spot on text"
+                      2 -> " · only with text"
+                      3 -> " · only without text"
+                      else -> ""
+                  }
+                  return "click ${(t.fx * 100).toInt()}%, ${(t.fy * 100).toInt()}% · wait ${t.cooldownMs} ms$cond"
+              }
+
+              private fun targetList(p: LinearLayout) {
+                  val c = context
+                  p.addView(Ui.button(c, "Add picture target", true, Ic.ADD) { host.newTarget() })
+                  p.addView(
+                      Ui.text(
+                          c,
+                          "Tap a target to change its picture, click spot, second spot, text condition, sensitivity and wait time.",
+                          12f, Theme.MUTED
+                      ).apply { setPadding(0, 0, 0, dp(8)) }
+                  )
+                  if (targets.isEmpty()) p.addView(Ui.text(c, "No targets yet.", 14f, Theme.MUTED))
+                  for (t in targets) {
+                      val bmp = Targets.bitmap(c, t) ?: continue
+                      val card = Ui.card(c)
+                      card.isClickable = true
+                      card.setOnClickListener { openId = t.id; render() }
+                      val row = LinearLayout(c).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                      }
+                      row.addView(
+                          ThumbView(c, bmp, t.fx, t.fy, false).apply { background = rounded(Theme.CARD2, context.dpf(10f)) },
+                          LinearLayout.LayoutParams(dp(88), dp(56))
+                      )
+                      val mid = LinearLayout(c).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(dp(10), 0, dp(6), 0)
+                      }
+                      mid.addView(Ui.text(c, t.name, 15f, Theme.TEXT, true))
+                      mid.addView(Ui.text(c, summary(t), 11f, Theme.MUTED))
+                      row.addView(mid, LinearLayout.LayoutParams(0, WRAP, 1f))
+                      row.addView(ToggleView(c, t.enabled) { on -> t.enabled = on; persist(); host.changed() })
+                      card.addView(row)
+                      p.addView(card)
+                  }
+              }
+
+              private fun regionText(t: Target): String =
+                  if (t.regOn) "Area: ${(t.rl * 100).toInt()}%,${(t.rt * 100).toInt()}% to ${(t.rr * 100).toInt()}%,${(t.rb * 100).toInt()}% of the screen"
+                  else "Area: whole screen"
+
+              private fun detail(p: LinearLayout, t: Target) {
+                  val c = context
+                  val bmp = Targets.bitmap(c, t)
+
+                  val top = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  top.addView(Ui.chip(c, "< Back", false) { back() })
+                  top.addView(
+                      edit(t.name, "Name") { v -> if (v.isNotBlank()) { t.name = v; persist() } },
+                      LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(8) }
+                  )
+                  p.addView(top)
+
+                  val prev: ThumbView? = if (bmp != null) {
+                      ThumbView(c, bmp, t.fx, t.fy, false, true).apply {
+                          if (t.altOn) { ax = t.ax; ay = t.ay }
+                          background = rounded(Theme.CARD2, c.dpf(12f))
+                      }
+                  } else null
+                  if (prev != null) p.addView(prev, LinearLayout.LayoutParams(MATCH, dp(130)).apply { topMargin = dp(8); bottomMargin = dp(4) })
+                  p.addView(Ui.text(c, "Gold = normal click spot.  Green = second spot (when turned on).", 11f, Theme.MUTED))
+
+                  val acts = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(0, dp(10), 0, dp(4))
+                  }
+                  acts.addView(Ui.chip(c, "Retake picture", false) { persist(); host.retake(t) })
+                  var armed = false
+                  val del = Ui.chip(c, "Delete", false) {}
+                  del.setOnClickListener {
+                      if (!armed) {
+                          armed = true
+                          del.text = "Tap again to delete"
+                      } else {
+                          Targets.delete(c, t)
+                          targets.remove(t)
+                          host.changed()
+                          openId = null
+                          render()
+                      }
+                  }
+                  acts.addView(del, LinearLayout.LayoutParams(WRAP, WRAP).apply { leftMargin = dp(8) })
+                  p.addView(acts)
+
+                  toggleRow(p, "Enabled", "", t.enabled) { t.enabled = it; persist(); host.changed() }
+
+                  section(p, "Where to click")
+                  pctSlider(p, "Click X (0% = left edge, 100% = right edge)", t.fx) { t.fx = it; prev?.fx = it; prev?.invalidate(); persist() }
+                  pctSlider(p, "Click Y (0% = top edge, 100% = bottom edge)", t.fy) { t.fy = it; prev?.fy = it; prev?.invalidate(); persist() }
+                  p.addView(Ui.text(c, "Values below 0% or above 100% click outside the picture. You can also drag the gold dot with the pencil button on the floating bar.", 11f, Theme.MUTED))
+
+                  section(p, "Second click spot")
+                  val abox = LinearLayout(c).apply { orientation = LinearLayout.VERTICAL }
+                  pctSlider(abox, "Second spot X", t.ax) { t.ax = it; if (t.altOn) prev?.ax = it; prev?.invalidate(); persist() }
+                  pctSlider(abox, "Second spot Y", t.ay) { t.ay = it; if (t.altOn) prev?.ay = it; prev?.invalidate(); persist() }
+                  abox.visibility = if (t.altOn) View.VISIBLE else View.GONE
+                  toggleRow(p, "Use a second click spot", "Chosen by the text condition below", t.altOn) { on ->
+                      t.altOn = on
+                      if (on) { prev?.ax = t.ax; prev?.ay = t.ay } else { prev?.ax = Float.NaN; prev?.ay = Float.NaN }
+                      prev?.invalidate()
+                      abox.visibility = if (on) View.VISIBLE else View.GONE
+                      persist()
+                  }
+                  p.addView(abox)
+
+                  section(p, "Text condition")
+                  val cbox = LinearLayout(c).apply { orientation = LinearLayout.VERTICAL }
+                  cbox.addView(edit(t.condText, "Text to look for (separate several with commas)") { t.condText = it; persist() })
+                  val regInfo = Ui.text(c, regionText(t), 12f, Theme.MUTED).apply { setPadding(0, dp(4), 0, dp(4)) }
+                  toggleRow(cbox, "Only look inside an area", "Drag a box where the text appears", t.regOn) { on ->
+                      t.regOn = on
+                      persist()
+                      regInfo.text = regionText(t)
+                  }
+                  cbox.addView(Ui.chip(c, "Set area on screen", true) { persist(); host.pickRegion(t) })
+                  cbox.addView(regInfo)
+                  cbox.visibility = if (t.condMode > 0) View.VISIBLE else View.GONE
+                  choice(
+                      p,
+                      listOf(
+                          "Off: always click",
+                          "Use the second spot while the text is visible",
+                          "Click only while the text is visible",
+                          "Click only while the text is NOT visible"
+                      ),
+                      t.condMode
+                  ) { i ->
+                      t.condMode = i
+                      cbox.visibility = if (i > 0) View.VISIBLE else View.GONE
+                      persist()
+                  }
+                  p.addView(cbox)
+
+                  section(p, "Matching")
+                  val globalThr = Store.threshold(c)
+                  var shown = (if (t.thr > 0) t.thr else globalThr).coerceIn(50, 95)
+                  val sbox = LinearLayout(c).apply { orientation = LinearLayout.VERTICAL }
+                  Ui.slider(c, sbox, "Sensitivity (lower = more tolerant)", 50, 95, 1, shown, "%") {
+                      shown = it
+                      if (t.thr > 0) { t.thr = it; persist() }
+                  }
+                  sbox.visibility = if (t.thr > 0) View.VISIBLE else View.GONE
+                  toggleRow(p, "Own sensitivity", "Off = use the global value ($globalThr%)", t.thr > 0) { on ->
+                      t.thr = if (on) shown else 0
+                      sbox.visibility = if (on) View.VISIBLE else View.GONE
+                      persist()
+                  }
+                  p.addView(sbox)
+                  Ui.slider(c, p, "Wait after clicking it", 200, 10000, 100, (t.cooldownMs.coerceIn(200, 10000) / 100) * 100, " ms") {
+                      t.cooldownMs = it
+                      persist()
+                  }
+              }
+
+              // ------------------------------------------------------------------ words
+
+              private fun wordsTab(p: LinearLayout) {
+                  val c = context
+                  p.addView(Ui.text(c, "The app reads the screen text (offline, English) and clicks any matching word.", 12f, Theme.MUTED))
+                  val add = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+                  val et = edit("", "New word, e.g. Claim") {}
+                  add.addView(et, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  add.addView(
+                      Ui.chip(c, "Add", true) {
+                          val w = et.text.toString().trim()
+                          if (w.isNotEmpty()) { Store.setWords(c, Store.words(c) + Pair(w, true)); render() }
+                      },
+                      LinearLayout.LayoutParams(WRAP, WRAP).apply { leftMargin = dp(8) }
+                  )
+                  p.addView(add)
+                  Store.words(c).forEachIndexed { i, w ->
+                      val r = LinearLayout(c).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(0, dp(4), 0, dp(4))
+                      }
+                      r.addView(Ui.text(c, w.first, 15f), LinearLayout.LayoutParams(0, WRAP, 1f))
+                      r.addView(ToggleView(c, w.second) { on ->
+                          val l = Store.words(c).toMutableList()
+                          if (i in l.indices) l[i] = Pair(l[i].first, on)
+                          Store.setWords(c, l)
+                      })
+                      r.addView(Ui.iconBtn(c, Ic.TRASH, Theme.BAD) {
+                          val l = Store.words(c).toMutableList()
+                          if (i in l.indices) l.removeAt(i)
+                          Store.setWords(c, l)
+                          render()
+                      })
+                      p.addView(r)
+                  }
+                  p.addView(Ui.gap(c, 8))
+                  p.addView(Ui.button(c, "Reset to presets", false) { Store.resetWords(c); render() })
+              }
+
+              // ------------------------------------------------------------------ settings
+
+              private fun settingsTab(p: LinearLayout) {
+                  val c = context
+                  Ui.slider(c, p, "Taps per second", 5, 30, 1, Store.cps(c), "") { Store.setCps(c, it) }
+                  Ui.slider(c, p, "Global match sensitivity (lower = more tolerant)", 60, 95, 1, Store.threshold(c), "%") { Store.setThreshold(c, it) }
+                  Ui.slider(c, p, "Look for pictures every", 200, 2000, 100, Store.scanMs(c).toInt(), " ms") { Store.setScanMs(c, it) }
+                  Ui.slider(c, p, "Read screen text every", 500, 5000, 100, Store.textMs(c).toInt().coerceIn(500, 5000), " ms") { Store.setTextMs(c, it) }
+                  toggleRow(p, "Flexible matching", "Also match other sizes, colours and shapes", Store.flex(c)) { Store.setFlex(c, it); host.changed() }
+                  toggleRow(p, "Show tap points", "Numbered rings where the farm taps land", Store.markers(c)) { Store.setMarkers(c, it); host.changed() }
+              }
+
+              // ------------------------------------------------------------------ profiles
+
+              private fun profilesTab(p: LinearLayout) {
+                  val c = context
+                  val act = Profiles.active(c)
+                  p.addView(Ui.text(c, "A profile stores your targets, tap points, words and settings.", 12f, Theme.MUTED))
+                  val sv = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+                  val et = edit(act, "Profile name") {}
+                  sv.addView(et, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  sv.addView(
+                      Ui.chip(c, "Save", true) {
+                          if (Profiles.save(c, et.text.toString())) { toast("Saved"); render() } else toast("Type a name first")
+                      },
+                      LinearLayout.LayoutParams(WRAP, WRAP).apply { leftMargin = dp(8) }
+                  )
+                  p.addView(sv)
+                  for (n in Profiles.list(c)) {
+                      val r = LinearLayout(c).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(0, dp(6), 0, dp(6))
+                      }
+                      r.addView(
+                          Ui.text(c, n, 15f, if (n == act) Theme.GOLD else Theme.TEXT, n == act),
+                          LinearLayout.LayoutParams(0, WRAP, 1f)
+                      )
+                      r.addView(Ui.chip(c, "Load", n != act) {
+                          if (Profiles.load(c, n)) {
+                              targets = Targets.list(c).toMutableList()
+                              host.changed()
+                              toast("Loaded $n")
+                              render()
+                          }
+                      })
+                      r.addView(Ui.iconBtn(c, Ic.TRASH, Theme.BAD) { Profiles.delete(c, n); render() })
+                      p.addView(r)
+                  }
+                  if (Profiles.list(c).isEmpty()) p.addView(Ui.text(c, "No saved profiles yet.", 13f, Theme.MUTED))
+              }
+          }
+          IC_EOF
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Profiles.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import org.json.JSONObject
+          import java.io.File
+
+          /** Named snapshots of: targets (+ click points), tap points, speed, sensitivity, scan interval. */
+          object Profiles {
+              private fun root(c: Context): File = File(c.filesDir, "profiles").apply { mkdirs() }
+
+              fun safe(n: String): String = n.trim().replace(Regex("[^\\p{L}\\p{N} _-]"), "_").take(40)
+
+              fun list(c: Context): List<String> =
+                  root(c).listFiles { f -> f.isDirectory }?.map { it.name }?.sorted() ?: emptyList()
+
+              fun active(c: Context): String = Store.prefs(c).getString("active", "") ?: ""
+
+              fun save(c: Context, name: String): Boolean {
+                  val n = safe(name)
+                  if (n.isEmpty()) return false
+                  val d = File(root(c), n)
+                  d.deleteRecursively(); d.mkdirs()
+                  Targets.dir(c).listFiles()?.forEach { it.copyTo(File(d, it.name), true) }
+                  val cfg = JSONObject()
+                      .put("cps", Store.cps(c)).put("thr", Store.threshold(c)).put("scan", Store.scanMs(c).toInt())
+                      .put("pts", Store.prefs(c).getString("pts", "") ?: "")
+                      .put("words", Store.wordsRaw(c)).put("hasWords", Store.prefs(c).contains("words"))
+                      .put("flex", Store.flex(c)).put("textms", Store.textMs(c).toInt())
+                  File(d, "config.json").writeText(cfg.toString())
+                  Store.prefs(c).edit().putString("active", n).apply()
+                  return true
+              }
+
+              fun load(c: Context, name: String): Boolean {
+                  val d = File(root(c), name)
+                  if (!d.isDirectory) return false
+                  Targets.clear(c)
+                  d.listFiles()?.forEach { if (it.name != "config.json") it.copyTo(File(Targets.dir(c), it.name), true) }
+                  try {
+                      val j = JSONObject(File(d, "config.json").readText())
+                      Store.setCps(c, j.optInt("cps", 15))
+                      Store.setThreshold(c, j.optInt("thr", 80))
+                      Store.setScanMs(c, j.optInt("scan", 500))
+                      Store.prefs(c).edit().putString("pts", j.optString("pts", "")).apply()
+                      if (j.optBoolean("hasWords", false)) Store.setWordsRaw(c, j.optString("words", "")) else Store.resetWords(c)
+                      Store.setFlex(c, j.optBoolean("flex", true))
+                      Store.setTextMs(c, j.optInt("textms", 1500))
+                  } catch (e: Exception) { }
+                  Store.prefs(c).edit().putString("active", name).apply()
+                  return true
+              }
+
+              fun delete(c: Context, name: String) {
+                  File(root(c), name).deleteRecursively()
+                  if (active(c) == name) Store.prefs(c).edit().remove("active").apply()
+              }
+          }
+          IC_EOF
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Store.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          object Store {
+              fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+              fun cps(c: Context): Int = prefs(c).getInt("cps", 15)
+              fun setCps(c: Context, v: Int) = prefs(c).edit().putInt("cps", v).apply()
+              fun threshold(c: Context): Int = prefs(c).getInt("thr", 80)
+              fun setThreshold(c: Context, v: Int) = prefs(c).edit().putInt("thr", v).apply()
+              fun scanMs(c: Context): Long = prefs(c).getInt("scan", 500).toLong()
+              fun setScanMs(c: Context, v: Int) = prefs(c).edit().putInt("scan", v).apply()
+              fun markers(c: Context): Boolean = prefs(c).getBoolean("markers", false)
+              fun setMarkers(c: Context, v: Boolean) = prefs(c).edit().putBoolean("markers", v).apply()
+
+              /** Unlimited farm tap points, stored as "x,y;x,y;..." */
+              fun points(c: Context): List<Pair<Float, Float>> {
+                  val raw = prefs(c).getString("pts", "") ?: ""
+                  return raw.split(";").mapNotNull {
+                      val s = it.split(",")
+                      val x = s.getOrNull(0)?.toFloatOrNull()
+                      val y = s.getOrNull(1)?.toFloatOrNull()
+                      if (x != null && y != null) Pair(x, y) else null
+                  }
+              }
+              fun setPoints(c: Context, list: List<Pair<Float, Float>>) =
+                  prefs(c).edit().putString("pts", list.joinToString(";") { "${it.first},${it.second}" }).apply()
+              fun removePoint(c: Context, i: Int) {
+                  val l = points(c).toMutableList()
+                  if (i in l.indices) { l.removeAt(i); setPoints(c, l) }
+              }
+
+              fun flex(c: Context): Boolean = prefs(c).getBoolean("flex", true)
+              fun setFlex(c: Context, v: Boolean) = prefs(c).edit().putBoolean("flex", v).apply()
+              fun textMs(c: Context): Long = prefs(c).getInt("textms", 1500).toLong()
+              fun setTextMs(c: Context, v: Int) = prefs(c).edit().putInt("textms", v).apply()
+
+              private val DEFAULT_WORDS = listOf("Claim", "Collect", "Skip", "Skip Ad", "Close", "Continue")
+
+              /** Words the app reads on screen (OCR) and clicks. Stored as "word|1;word|0" */
+              fun words(c: Context): List<Pair<String, Boolean>> {
+                  val raw = prefs(c).getString("words", null) ?: return DEFAULT_WORDS.map { Pair(it, true) }
+                  return raw.split(";").filter { it.isNotBlank() }.map {
+                      val i = it.lastIndexOf('|')
+                      if (i < 0) Pair(it, true) else Pair(it.substring(0, i), it.substring(i + 1) == "1")
+                  }
+              }
+              fun wordsRaw(c: Context): String = prefs(c).getString("words", "") ?: ""
+              fun setWordsRaw(c: Context, raw: String) = prefs(c).edit().putString("words", raw).apply()
+              fun setWords(c: Context, list: List<Pair<String, Boolean>>) =
+                  setWordsRaw(c, list.joinToString(";") {
+                      it.first.replace(";", " ").replace("|", " ").trim() + "|" + (if (it.second) "1" else "0")
+                  })
+              fun resetWords(c: Context) = prefs(c).edit().remove("words").apply()
+          }
+          IC_EOF
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Targets.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.FileOutputStream
+
+          /**
+           * One picture to look for.
+           * fx/fy      = where the click lands, relative to the picture (0..1 = inside it, can go outside)
+           * altOn/ax/ay = optional second click spot (used by condMode 1)
+           * condMode   = 0 off | 1 use second spot when the text is visible | 2 click only if text visible | 3 click only if text NOT visible
+           * regOn + rl..rb = optional screen area (fractions 0..1) where the text must be
+           */
+          class Target(
+              val id: String,
+              var name: String,
+              var enabled: Boolean = true,
+              var fx: Float = 0.5f,
+              var fy: Float = 0.5f
+          ) {
+              var thr = 0                 // 0 = use the global sensitivity
+              var cooldownMs = 1000       // wait after clicking this target
+              var altOn = false
+              var ax = 0.5f
+              var ay = 0.5f
+              var condMode = 0
+              var condText = ""
+              var regOn = false
+              var rl = 0f
+              var rt = 0f
+              var rr = 1f
+              var rb = 1f
+          }
+
+          object Targets {
+              fun dir(c: Context): File = File(c.filesDir, "targets").apply { mkdirs() }
+              private fun image(c: Context, t: Target): File = File(dir(c), t.id + ".png")
+
+              fun list(c: Context): List<Target> {
+                  val out = ArrayList<Target>()
+                  try {
+                      val f = File(dir(c), "meta.json")
+                      if (f.exists()) {
+                          val a = JSONArray(f.readText())
+                          for (i in 0 until a.length()) {
+                              val o = a.getJSONObject(i)
+                              val id = o.getString("id")
+                              if (File(dir(c), "$id.png").exists()) {
+                                  val t = Target(
+                                      id, o.optString("name", "Target"), o.optBoolean("on", true),
+                                      o.optDouble("fx", 0.5).toFloat(), o.optDouble("fy", 0.5).toFloat()
+                                  )
+                                  t.thr = o.optInt("thr", 0)
+                                  t.cooldownMs = o.optInt("cd", 1000)
+                                  t.altOn = o.optBoolean("altOn", false)
+                                  t.ax = o.optDouble("ax", 0.5).toFloat()
+                                  t.ay = o.optDouble("ay", 0.5).toFloat()
+                                  t.condMode = o.optInt("cm", 0)
+                                  t.condText = o.optString("ct", "")
+                                  t.regOn = o.optBoolean("regOn", false)
+                                  t.rl = o.optDouble("rl", 0.0).toFloat()
+                                  t.rt = o.optDouble("rt", 0.0).toFloat()
+                                  t.rr = o.optDouble("rr", 1.0).toFloat()
+                                  t.rb = o.optDouble("rb", 1.0).toFloat()
+                                  out.add(t)
+                              }
+                          }
+                      }
+                  } catch (e: Exception) { }
+                  return out
+              }
+
+              fun saveAll(c: Context, list: List<Target>) {
+                  val a = JSONArray()
+                  for (t in list) {
+                      a.put(
+                          JSONObject().put("id", t.id).put("name", t.name).put("on", t.enabled)
+                              .put("fx", t.fx.toDouble()).put("fy", t.fy.toDouble())
+                              .put("thr", t.thr).put("cd", t.cooldownMs)
+                              .put("altOn", t.altOn).put("ax", t.ax.toDouble()).put("ay", t.ay.toDouble())
+                              .put("cm", t.condMode).put("ct", t.condText)
+                              .put("regOn", t.regOn).put("rl", t.rl.toDouble()).put("rt", t.rt.toDouble())
+                              .put("rr", t.rr.toDouble()).put("rb", t.rb.toDouble())
+                      )
+                  }
+                  val f = File(dir(c), "meta.json")
+                  val tmp = File(dir(c), "meta.tmp")
+                  tmp.writeText(a.toString())
+                  if (!tmp.renameTo(f)) { f.writeText(a.toString()); tmp.delete() }
+              }
+
+              /** Writes the picture, returns the new Target (caller adds it to its list and calls saveAll). */
+              fun createImage(c: Context, crop: Bitmap): Target {
+                  val id = "t" + System.currentTimeMillis()
+                  FileOutputStream(File(dir(c), "$id.png")).use { crop.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                  return Target(id, "Target", true, 0.5f, 0.5f)
+              }
+
+              /** Swaps the picture of an existing target (keeps all its settings). */
+              fun replaceImage(c: Context, t: Target, crop: Bitmap) {
+                  FileOutputStream(image(c, t)).use { crop.compress(Bitmap.CompressFormat.PNG, 100, it) }
+              }
+
+              fun delete(c: Context, t: Target) {
+                  image(c, t).delete()
+                  saveAll(c, list(c).filter { it.id != t.id })
+              }
+
+              fun clear(c: Context) { dir(c).listFiles()?.forEach { it.delete() } }
+
+              fun bitmap(c: Context, t: Target): Bitmap? = BitmapFactory.decodeFile(image(c, t).path)
+          }
+          IC_EOF
+          cat > ic-android/app/src/main/java/com/autoclicker/imageclicker/Ui.kt <<'IC_EOF'
+          package com.autoclicker.imageclicker
+
+          import android.content.Context
+          import android.content.res.ColorStateList
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.graphics.Bitmap
+          import android.graphics.drawable.GradientDrawable
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import kotlin.math.min
+
+          object Theme {
+              val BG = 0xFF0F0A28.toInt()
+              val CARD = 0xFF1C1445.toInt()
+              val CARD2 = 0xFF2A1F63.toInt()
+              val ACCENT = 0xFF7C5CFF.toInt()
+              val GOLD = 0xFFFFC93C.toInt()
+              val TEXT = 0xFFF3F0FF.toInt()
+              val MUTED = 0xFFA79FD0.toInt()
+              val ICON = 0xFFEDE9FE.toInt()
+              val OK = 0xFF34D399.toInt()
+              val BAD = 0xFFF87171.toInt()
+          }
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+          fun Context.dpf(v: Float): Float = v * resources.displayMetrics.density
+
+          fun rounded(color: Int, radius: Float, stroke: Int = 0, strokeW: Int = 0): GradientDrawable =
+              GradientDrawable().apply {
+                  setColor(color)
+                  cornerRadius = radius
+                  if (strokeW > 0) setStroke(strokeW, stroke)
+              }
+
+          object Ui {
+              private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+              fun text(c: Context, t: String, size: Float = 15f, color: Int = Theme.TEXT, bold: Boolean = false): TextView =
+                  TextView(c).apply {
+                      text = t
+                      textSize = size
+                      setTextColor(color)
+                      if (bold) typeface = Typeface.DEFAULT_BOLD
+                  }
+
+              fun card(c: Context): LinearLayout = LinearLayout(c).apply {
+                  orientation = LinearLayout.VERTICAL
+                  background = rounded(Theme.CARD, c.dpf(18f))
+                  setPadding(c.dp(16), c.dp(14), c.dp(16), c.dp(14))
+                  layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = c.dp(12) }
+              }
+
+              fun gap(c: Context, h: Int): View = View(c).apply { layoutParams = LinearLayout.LayoutParams(MATCH, c.dp(h)) }
+
+              fun button(c: Context, label: String, primary: Boolean = true, icon: Int = -1, onClick: () -> Unit): View {
+                  val row = LinearLayout(c).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      background = rounded(if (primary) Theme.ACCENT else Theme.CARD2, c.dpf(14f))
+                      setPadding(c.dp(14), c.dp(12), c.dp(14), c.dp(12))
+                      layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = c.dp(8) }
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                  }
+                  if (icon >= 0) {
+                      row.addView(IconView(c, icon), LinearLayout.LayoutParams(c.dp(20), c.dp(20)).apply { rightMargin = c.dp(8) })
+                  }
+                  row.addView(text(c, label, 15f, Theme.TEXT, true))
+                  return row
+              }
+
+              fun chip(c: Context, label: String, selected: Boolean = true, onClick: () -> Unit): TextView =
+                  TextView(c).apply {
+                      text = label
+                      textSize = 13f
+                      setTextColor(Theme.TEXT)
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(c.dp(14), c.dp(7), c.dp(14), c.dp(7))
+                      background = rounded(if (selected) Theme.ACCENT else Theme.CARD2, c.dpf(14f))
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                  }
+
+              fun iconBtn(c: Context, icon: Int, tint: Int = Theme.ICON, onClick: () -> Unit): View =
+                  FrameLayout(c).apply {
+                      background = rounded(Theme.CARD2, c.dpf(12f))
+                      isClickable = true
+                      setOnClickListener { onClick() }
+                      addView(IconView(c, icon, tint), FrameLayout.LayoutParams(c.dp(20), c.dp(20), Gravity.CENTER))
+                      layoutParams = LinearLayout.LayoutParams(c.dp(40), c.dp(40)).apply { leftMargin = c.dp(8) }
+                  }
+
+              fun slider(
+                  c: Context, parent: LinearLayout, title: String,
+                  lo: Int, hi: Int, step: Int, cur: Int, unit: String, save: (Int) -> Unit
+              ) {
+                  val label = text(c, "$title: $cur$unit", 14f, Theme.TEXT)
+                  label.setPadding(0, c.dp(10), 0, 0)
+                  parent.addView(label)
+                  val bar = SeekBar(c)
+                  bar.progressTintList = ColorStateList.valueOf(Theme.ACCENT)
+                  bar.progressBackgroundTintList = ColorStateList.valueOf(Theme.CARD2)
+                  bar.thumbTintList = ColorStateList.valueOf(Theme.GOLD)
+                  bar.max = (hi - lo) / step
+                  bar.progress = (cur - lo) / step
+                  bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          val v = lo + p * step
+                          save(v)
+                          label.text = "$title: $v$unit"
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  parent.addView(bar)
+              }
+          }
+
+          class ToggleView(c: Context, var on: Boolean, private val onChange: (Boolean) -> Unit) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              init {
+                  isClickable = true
+                  setOnClickListener { on = !on; invalidate(); onChange(on) }
+              }
+              override fun onMeasure(w: Int, h: Int) {
+                  setMeasuredDimension(context.dp(46), context.dp(26))
+              }
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  p.color = if (on) Theme.ACCENT else Theme.CARD2
+                  cv.drawRoundRect(RectF(0f, 0f, w, h), h / 2, h / 2, p)
+                  p.color = if (on) Theme.GOLD else Theme.MUTED
+                  val r = h / 2 - context.dpf(3f)
+                  cv.drawCircle(if (on) w - h / 2 else h / 2, h / 2, r, p)
+              }
+          }
+
+          /** Shows a target picture with a gold cross where the click lands. Interactive = tap to move the cross.
+           *  wide = draw the picture smaller so click spots outside the picture are visible too.
+           *  ax/ay (when not NaN) = second click spot, drawn in green. */
+          class ThumbView(
+              c: Context,
+              private val bmp: Bitmap,
+              var fx: Float,
+              var fy: Float,
+              private val interactive: Boolean = false,
+              private val wide: Boolean = false
+          ) : View(c) {
+              var ax = Float.NaN
+              var ay = Float.NaN
+              private val bp = Paint(Paint.FILTER_BITMAP_FLAG)
+              private val cp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = Theme.GOLD
+                  strokeWidth = c.dpf(2f)
+              }
+              private val gp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = Theme.OK
+                  strokeWidth = c.dpf(2f)
+              }
+              private val wp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = 0xFF000000.toInt()
+                  strokeWidth = c.dpf(4f)
+              }
+              private val bd = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = Theme.MUTED
+                  strokeWidth = c.dpf(1f)
+              }
+
+              private fun dst(): RectF {
+                  var s = min(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
+                  if (wide) s *= 0.4f
+                  val w = bmp.width * s
+                  val h = bmp.height * s
+                  val l = (width - w) / 2f
+                  val t = (height - h) / 2f
+                  return RectF(l, t, l + w, t + h)
+              }
+
+              private fun dot(cv: Canvas, x: Float, y: Float, color: Paint) {
+                  val rad = context.dpf(8f)
+                  val tick = context.dpf(6f)
+                  for (pt in listOf(wp, color)) {
+                      cv.drawCircle(x, y, rad, pt)
+                      cv.drawLine(x - rad - tick, y, x - rad, y, pt); cv.drawLine(x + rad, y, x + rad + tick, y, pt)
+                      cv.drawLine(x, y - rad - tick, x, y - rad, pt); cv.drawLine(x, y + rad, x, y + rad + tick, pt)
+                  }
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val r = dst()
+                  cv.drawBitmap(bmp, null, r, bp)
+                  if (wide) cv.drawRect(r, bd)
+                  dot(cv, r.left + r.width() * fx, r.top + r.height() * fy, cp)
+                  if (!ax.isNaN() && !ay.isNaN()) dot(cv, r.left + r.width() * ax, r.top + r.height() * ay, gp)
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (!interactive) return false
+                  val r = dst()
+                  fx = ((e.x - r.left) / r.width()).coerceIn(0f, 1f)
+                  fy = ((e.y - r.top) / r.height()).coerceIn(0f, 1f)
+                  invalidate()
+                  return true
+              }
+          }
+          IC_EOF
           IC_EOF
           base64 -d > ic-android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png <<'IC_EOF'
           iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAABgFBMVEXenmBkWqKjZlwkF1/12ZZeaeKOZOGSaZmgnvLTbTGtUy9n
